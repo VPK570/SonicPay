@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Expo & React Native
+.expo/
+.expo-shared/
+.expoweb/
+
+# Build artifacts
+android/
+ios/
+web-build/
+
+# Misc
+.DS_Store
+*.log
