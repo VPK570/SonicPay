@@ -4,15 +4,13 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/adc.h"
-#include "driver/gptimer.h"
+#include "esp_adc/adc_continuous.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 
 #define TAG         "SonicPay"
-#define MIC_CHANNEL ADC1_CHANNEL_6
+#define MIC_CHANNEL ADC_CHANNEL_6
 #define SAMPLE_RATE 40000
-#define BUF_LEN     1024
 
 // ── FSK config ────────────────────────────────────────────────────
 #define NUM_TONES       8
@@ -37,54 +35,37 @@ typedef enum {
 } DemodState;
 
 // ── Sample buffer ─────────────────────────────────────────────────
-// We collect samples into a symbol-sized window
 #define SYMBOL_BUF_LEN SYMBOL_SAMPLES
 static int16_t symbolBuf[SYMBOL_BUF_LEN];
-static volatile int  sampleIdx = 0;
-static volatile bool symbolReady = false;
+static int sampleIdx = 0;
 
-static gptimer_handle_t timer = NULL;
+static adc_continuous_handle_t adc_handle = NULL;
 
-// ── Timer ISR ─────────────────────────────────────────────────────
-static bool IRAM_ATTR onTimer(gptimer_handle_t t,
-                               const gptimer_alarm_event_data_t *edata,
-                               void *user_ctx) {
-    if (sampleIdx < SYMBOL_BUF_LEN && !symbolReady) {
-        int raw = adc1_get_raw(MIC_CHANNEL);
-        symbolBuf[sampleIdx++] = (int16_t)(raw - 2048);
-        if (sampleIdx >= SYMBOL_BUF_LEN) {
-            symbolReady = true;
-            sampleIdx   = 0;
-        }
-    }
-    return false;
-}
-
-// ── ADC + timer init ──────────────────────────────────────────────
+// ── ADC init ──────────────────────────────────────────────────────
 static void initHardware(void) {
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(MIC_CHANNEL, ADC_ATTEN_DB_11);
-
-    gptimer_config_t cfg = {
-        .clk_src       = GPTIMER_CLK_SRC_DEFAULT,
-        .direction     = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000,
+    adc_continuous_handle_cfg_t adc_config = {
+        .max_store_buf_size = 16384,
+        .conv_frame_size    = 1024,
     };
-    ESP_ERROR_CHECK(gptimer_new_timer(&cfg, &timer));
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &adc_handle));
 
-    gptimer_alarm_config_t alarm = {
-        .alarm_count                = 1000000 / SAMPLE_RATE,
-        .reload_count               = 0,
-        .flags.auto_reload_on_alarm = true,
+    adc_digi_pattern_config_t adc_pattern[1] = {0};
+    adc_pattern[0].atten     = ADC_ATTEN_DB_11;
+    adc_pattern[0].channel   = MIC_CHANNEL;
+    adc_pattern[0].unit      = ADC_UNIT_1;
+    adc_pattern[0].bit_width = ADC_BITWIDTH_12;
+
+    adc_continuous_config_t dig_cfg = {
+        .pattern_num    = 1,
+        .adc_pattern    = adc_pattern,
+        .sample_freq_hz = SAMPLE_RATE,
+        .conv_mode      = ADC_CONV_SINGLE_UNIT_1,
+        .format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1,
     };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(timer, &alarm));
+    ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
+    ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 
-    gptimer_event_callbacks_t cbs = { .on_alarm = onTimer };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timer, &cbs, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(timer));
-    ESP_ERROR_CHECK(gptimer_start(timer));
-
-    ESP_LOGI(TAG, "Hardware ready");
+    ESP_LOGI(TAG, "Hardware ready (Continuous DMA mode)");
 }
 
 // ── Goertzel ──────────────────────────────────────────────────────
@@ -102,8 +83,6 @@ static float goertzel(int16_t *buf, int len, float freq, float sr) {
 }
 
 // ── Detect dominant tone index 0-7, -1 = silence ──────────────────
-// Returns detected tone index (0-7) or -1 for silence.
-// Also fills out_maxPower and out_snr for diagnostics if non-NULL.
 static int detectToneFull(int16_t *buf, int len, float *out_maxPower, float *out_snr) {
     float powers[NUM_TONES];
     float maxPower = 0;
@@ -125,20 +104,14 @@ static int detectToneFull(int16_t *buf, int len, float *out_maxPower, float *out
     if (out_maxPower) *out_maxPower = maxPower;
     if (out_snr)      *out_snr      = snr;
 
-    // Real signal: 28M-50M power. Ambient noise: 50K-3M. Gate at 5M.
     if (maxPower < 5e6) return -1;
-    // SNR must be clear — real tones show 8-30x, noise is 2-4x
     if (snr < 5.0f)     return -1;
     return maxIdx;
 }
 
-static int detectTone(int16_t *buf, int len) {
-    return detectToneFull(buf, len, NULL, NULL);
-}
-
 // ── Bit accumulator ───────────────────────────────────────────────
 static uint8_t  payloadBuf[MAX_PAYLOAD_BYTES];
-static int      payloadBits  = 0;   // total bits accumulated
+static int      payloadBits  = 0;
 static int      payloadBytes = 0;
 
 static void resetPayload(void) {
@@ -147,7 +120,6 @@ static void resetPayload(void) {
     payloadBytes = 0;
 }
 
-// Push 3 bits (one FSK symbol) into payloadBuf
 static void pushBits(int symbolIdx) {
     for (int bit = 2; bit >= 0; bit--) {
         int b        = (symbolIdx >> bit) & 1;
@@ -166,115 +138,123 @@ static void demodTask(void *arg) {
     DemodState state       = STATE_IDLE;
     int        f0Count     = 0;
     int        postCount   = 0;
-    int        dataCount   = 0;  // non-F0 data symbols received — gate for postamble
-    int        diagCount   = 0;  // counts symbols processed for periodic diagnostics
+    int        dataCount   = 0;
+    int        diagCount   = 0;
 
-    esp_task_wdt_add(NULL); // Register demodTask with Task WDT
+    esp_task_wdt_add(NULL);
     ESP_LOGI(TAG, "Demod running — waiting for preamble...");
     ESP_LOGI(TAG, "[DIAG] Will print raw power/SNR every ~2s while idle");
 
-    while (1) {
-        esp_task_wdt_reset(); // Feed watchdog timer
+    uint8_t rx_buf[1024];
 
-        if (!symbolReady) {
+    while (1) {
+        esp_task_wdt_reset();
+
+        uint32_t ret_num = 0;
+        esp_err_t ret = adc_continuous_read(adc_handle, rx_buf, sizeof(rx_buf), &ret_num, pdMS_TO_TICKS(10));
+        if (ret != ESP_OK || ret_num == 0) {
             vTaskDelay(1);
             continue;
         }
 
-        // copy symbol buffer safely
-        int16_t localBuf[SYMBOL_BUF_LEN];
-        memcpy(localBuf, symbolBuf, sizeof(localBuf));
-        symbolReady = false;
+        adc_digi_output_data_t *p = (adc_digi_output_data_t *)rx_buf;
+        uint32_t count = ret_num / sizeof(adc_digi_output_data_t);
 
-        float rawPower = 0, rawSnr = 0;
-        int tone = detectToneFull(localBuf, SYMBOL_BUF_LEN, &rawPower, &rawSnr);
+        for (uint32_t i = 0; i < count; i++) {
+            if (p[i].type1.channel == MIC_CHANNEL) {
+                symbolBuf[sampleIdx++] = (int16_t)((int)p[i].type1.data - 2048);
+            }
 
-        // Diagnostics: every 50 symbols (~2s) while idle, print raw signal levels
-        if (state == STATE_IDLE) {
-            diagCount++;
-            if (diagCount >= 50) {
-                diagCount = 0;
-                ESP_LOGI(TAG, "[DIAG] maxPower=%.0f snr=%.2f tone=%d", rawPower, rawSnr, tone);
+            if (sampleIdx < SYMBOL_BUF_LEN) {
+                continue;
+            }
+
+            // Symbol window complete
+            sampleIdx = 0;
+
+            int16_t localBuf[SYMBOL_BUF_LEN];
+            memcpy(localBuf, symbolBuf, sizeof(localBuf));
+
+            float rawPower = 0, rawSnr = 0;
+            int tone = detectToneFull(localBuf, SYMBOL_BUF_LEN, &rawPower, &rawSnr);
+
+            if (state == STATE_IDLE) {
+                diagCount++;
+                if (diagCount >= 50) {
+                    diagCount = 0;
+                    ESP_LOGI(TAG, "[DIAG] maxPower=%.0f snr=%.2f tone=%d", rawPower, rawSnr, tone);
+                }
+            }
+
+            switch (state) {
+                case STATE_IDLE:
+                    if (tone == 0) {
+                        f0Count = 1;
+                        state   = STATE_PREAMBLE;
+                        ESP_LOGI(TAG, "Preamble starting...");
+                    }
+                    break;
+
+                case STATE_PREAMBLE:
+                    if (tone == 0) {
+                        f0Count++;
+                        if (f0Count >= PREAMBLE_SYMS) {
+                            ESP_LOGI(TAG, "Preamble locked (%d F0s) — awaiting first data symbol", f0Count);
+                            state     = STATE_DATA;
+                            dataCount = 0;
+                            resetPayload();
+                        } else {
+                            ESP_LOGI(TAG, "Preamble F0 count: %d / %d", f0Count, PREAMBLE_SYMS);
+                        }
+                    } else if (tone == -1) {
+                        // acoustic dropout
+                    } else {
+                        ESP_LOGW(TAG, "Preamble broken — back to idle");
+                        f0Count = 0;
+                        state   = STATE_IDLE;
+                    }
+                    break;
+
+                case STATE_DATA:
+                    if (tone == 0) {
+                        if (dataCount > 0) {
+                            postCount = 1;
+                            state     = STATE_POSTAMBLE;
+                        }
+                    } else if (tone == -1) {
+                        // silence mid-data
+                    } else {
+                        pushBits(tone);
+                        dataCount++;
+                    }
+                    break;
+
+                case STATE_POSTAMBLE:
+                    if (tone == 0) {
+                        postCount++;
+                        if (postCount >= POSTAMBLE_SYMS) {
+                            ESP_LOGI(TAG, "=== Transmission complete ===");
+                            ESP_LOGI(TAG, "Total bits: %d | bytes: %d", payloadBits, payloadBytes);
+                            printf("RAW BYTES (hex): ");
+                            for (int k = 0; k < payloadBytes; k++) {
+                                printf("%02X ", payloadBuf[k]);
+                            }
+                            printf("\n");
+                            printf("RAW STRING: %.*s\n", payloadBytes, (char*)payloadBuf);
+                            state     = STATE_IDLE;
+                            f0Count   = 0;
+                            postCount = 0;
+                            dataCount = 0;
+                        }
+                    } else if (tone != -1) {
+                        pushBits(0);
+                        pushBits(tone);
+                        dataCount += 2;
+                        state = STATE_DATA;
+                    }
+                    break;
             }
         }
-
-        switch (state) {
-
-            case STATE_IDLE:
-                if (tone == 0) {
-                    f0Count = 1;
-                    state   = STATE_PREAMBLE;
-                    ESP_LOGI(TAG, "Preamble starting...");
-                }
-                break;
-
-            case STATE_PREAMBLE:
-                if (tone == 0) {
-                    f0Count++;
-                    if (f0Count >= PREAMBLE_SYMS) {
-                        // Consume any remaining preamble F0 symbols by staying in PREAMBLE
-                        // until we see a non-F0, non-silence tone — that's the first data symbol
-                        ESP_LOGI(TAG, "Preamble locked (%d F0s) — awaiting first data symbol", f0Count);
-                        state     = STATE_DATA;
-                        dataCount = 0;
-                        resetPayload();
-                    } else {
-                        ESP_LOGI(TAG, "Preamble F0 count: %d / %d", f0Count, PREAMBLE_SYMS);
-                    }
-                } else if (tone == -1) {
-                    // momentary acoustic dropout — hold count
-                } else {
-                    // false start (different frequency)
-                    ESP_LOGW(TAG, "Preamble broken — back to idle");
-                    f0Count = 0;
-                    state   = STATE_IDLE;
-                }
-                break;
-
-            case STATE_DATA:
-                if (tone == 0) {
-                    // Only treat F0 as postamble if we've seen at least 1 real data symbol.
-                    // This prevents the preamble tail (extra F0 symbols) from firing postamble.
-                    if (dataCount > 0) {
-                        postCount = 1;
-                        state     = STATE_POSTAMBLE;
-                    }
-                    // else: still flushing preamble tail — ignore this F0
-                } else if (tone == -1) {
-                    // silence mid-data — skip symbol
-                } else {
-                    pushBits(tone);
-                    dataCount++;
-                }
-                break;
-
-            case STATE_POSTAMBLE:
-                if (tone == 0) {
-                    postCount++;
-                    if (postCount >= POSTAMBLE_SYMS) {
-                        ESP_LOGI(TAG, "=== Transmission complete ===");
-                        ESP_LOGI(TAG, "Total bits: %d | bytes: %d", payloadBits, payloadBytes);
-                        printf("RAW BYTES (hex): ");
-                        for (int i = 0; i < payloadBytes; i++) {
-                            printf("%02X ", payloadBuf[i]);
-                        }
-                        printf("\n");
-                        printf("RAW STRING: %.*s\n", payloadBytes, (char*)payloadBuf);
-                        state     = STATE_IDLE;
-                        f0Count   = 0;
-                        postCount = 0;
-                        dataCount = 0;
-                    }
-                } else if (tone != -1) {
-                    // was a data symbol not postamble
-                    pushBits(0);       // the F0 we held back was actually data
-                    pushBits(tone);
-                    dataCount += 2;
-                    state = STATE_DATA;
-                }
-                break;
-        }
-        vTaskDelay(1); // Yield to FreeRTOS IDLE task
     }
 }
 
