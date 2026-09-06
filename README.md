@@ -1,23 +1,20 @@
-# SonicPay 🔊💳
-
-> **Offline Acoustic Micropayments via Encrypted Audio Chirps**  
-> *36-Hour Hackathon Project*
+# SonicPay 
 
 SonicPay is an offline-first micropayment system that enables secure, contactless transactions without internet, cellular connectivity, or Bluetooth. It uses high-frequency **M-FSK (Multiple Frequency-Shift Keying)** audio chirps (12–15 kHz) to transmit Ed25519-signed transaction payloads from a mobile application to a receiver terminal (ESP32).
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
-- **📶 100% Offline**: No cellular data, Wi-Fi, internet connection, or Bluetooth pairing required.
-- **🔐 Cryptographically Secure**: Transactions are signed on-device using **Ed25519** asymmetric cryptography (via `tweetnacl`).
-- **🛡️ Replay Protection**: Monotonic nonce management persisted via `AsyncStorage` prevents transaction replay attacks.
-- **🎵 Acoustic Data Transfer**: Data encoded into M-FSK audio tones in the 12 kHz – 15 kHz frequency band, designed to be audible yet masked in ambient room noise.
-- **⚡ Real-Time Hardware Demodulation**: Hardware terminal running on ESP32 using the **Goertzel algorithm** for low-latency DSP tone detection and state-machine decoding.
+- ** 100% Offline**: No cellular data, Wi-Fi, internet connection, or Bluetooth pairing required.
+- ** Cryptographically Secure**: Transactions are signed on-device using **Ed25519** asymmetric cryptography (via `tweetnacl`).
+- ** Replay Protection**: Monotonic nonce management persisted via `AsyncStorage` prevents transaction replay attacks.
+- ** Acoustic Data Transfer**: Data encoded into M-FSK audio tones in the 12 kHz – 15 kHz frequency band, designed to be audible yet masked in ambient room noise.
+- ** Real-Time Hardware Demodulation**: Hardware terminal running on ESP32 using the **Goertzel algorithm** for low-latency DSP tone detection and state-machine decoding.
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -37,7 +34,7 @@ SonicPay is an offline-first micropayment system that enables secure, contactles
 
 ---
 
-## 📜 Chirp Protocol Specification
+##  Chirp Protocol Specification
 
 | Parameter | Specification |
 |---|---|
@@ -51,7 +48,7 @@ SonicPay is an offline-first micropayment system that enables secure, contactles
 
 ---
 
-## 📂 Repository Layout
+##  Repository Layout
 
 ```
 .
@@ -71,9 +68,9 @@ SonicPay is an offline-first micropayment system that enables secure, contactles
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
-### 📱 Mobile App Setup (`SonicPay`)
+###  Mobile App Setup (`SonicPay`)
 
 **Prerequisites:** Node.js (v18+) and Expo Go / Android Studio / Xcode.
 
@@ -96,7 +93,7 @@ SonicPay is an offline-first micropayment system that enables secure, contactles
 
 ---
 
-### 📟 Hardware Receiver Setup (`hardware`)
+###  Hardware Receiver Setup (`hardware`)
 
 **Prerequisites:** ESP-IDF v5.x development framework configured for ESP32.
 
@@ -117,7 +114,7 @@ SonicPay is an offline-first micropayment system that enables secure, contactles
 
 ---
 
-## 🛠️ Tech Stack
+##  Tech Stack
 
 - **Mobile Client**: React Native, Expo Managed Workflow, `expo-audio`, `tweetnacl`, `@react-native-async-storage/async-storage`
 - **Hardware Firmware**: ESP32 C (ESP-IDF v5.x), FreeRTOS, ESP32 ADC Driver, GPTimer, Goertzel Algorithm DSP
