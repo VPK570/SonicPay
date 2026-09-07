@@ -67,8 +67,8 @@ static const uint8_t MERCHANT_PUBLIC_KEY[32] = {
 // Preamble consecutive-hit timeout guard (500 ms = ~8 symbol slots)
 #define PREAMBLE_HIT_TIMEOUT_MS  500
 
-// Idle flush timeout (3 seconds)
-#define IDLE_TIMEOUT_MS  3000
+// Idle flush timeout (800 ms for fast error detection without dropping normal payments)
+#define IDLE_TIMEOUT_MS  800
 
 static const float TARGET_FREQS[NUM_TONES] = {
     2050,  // Tone 0: 2.050 kHz (Dedicated Sync — preamble + postamble)
@@ -222,10 +222,10 @@ static void processPayload(void) {
         return;
     }
 
-    uint16_t amountPaise = ((uint16_t)payloadBuf[0] << 8) | payloadBuf[1];
-    uint16_t nonce       = ((uint16_t)payloadBuf[2] << 8) | payloadBuf[3];
-    uint16_t rxCrc       = ((uint16_t)payloadBuf[68] << 8) | payloadBuf[69];
-    uint16_t calCrc      = crc16_ccitt(payloadBuf, 68);
+    uint16_t amountRupees = ((uint16_t)payloadBuf[0] << 8) | payloadBuf[1];
+    uint16_t nonce        = ((uint16_t)payloadBuf[2] << 8) | payloadBuf[3];
+    uint16_t rxCrc        = ((uint16_t)payloadBuf[68] << 8) | payloadBuf[69];
+    uint16_t calCrc       = crc16_ccitt(payloadBuf, 68);
 
     if (rxCrc != calCrc) {
         ESP_LOGW(TAG, "CRC mismatch (rx=0x%04X calc=0x%04X) — packet discarded", rxCrc, calCrc);
@@ -244,8 +244,8 @@ static void processPayload(void) {
     
     int sigStatus = crypto_ed25519_check(sig, MERCHANT_PUBLIC_KEY, msg, 4);
 
-    uint32_t rupees = amountPaise / 100;
-    uint32_t paise  = amountPaise % 100;
+    uint32_t rupees = amountRupees;
+    uint32_t paise  = 0;
 
     if (sigStatus != 0) {
         ESP_LOGW(TAG, "❌ SIGNATURE VERIFICATION FAILED!");
@@ -271,11 +271,11 @@ static void processPayload(void) {
     }
 
     // ── Record transaction & give Success feedback ──────────────────
-    ledger_add_entry(nonce, amountPaise);
+    ledger_add_entry(nonce, (uint32_t)amountRupees * 100);
 
     ESP_LOGI(TAG, "=================================================");
     ESP_LOGI(TAG, "  ✅ TRANSACTION APPROVED & RECORDED!            ");
-    ESP_LOGI(TAG, "  💰 AMOUNT : ₹%"PRIu32".%02"PRIu32"  (%u paise)  ", rupees, paise, amountPaise);
+    ESP_LOGI(TAG, "  💰 AMOUNT : ₹%"PRIu32".%02"PRIu32"  (%u rupees) ", rupees, paise, amountRupees);
     ESP_LOGI(TAG, "  🔢 NONCE  : #%u                                ", nonce);
     ESP_LOGI(TAG, "=================================================");
 
@@ -294,6 +294,7 @@ static void demodTask(void *arg) {
     int        consecutiveF0      = 0;
     int        postCount          = 0;
     int        dataCount          = 0;
+    int        silenceCount       = 0;
     int64_t    lastSymbolTimeMs   = 0;
     int64_t    preambleLockTimeMs = 0;
     int64_t    lastF0HitMs        = 0;
@@ -413,6 +414,7 @@ static void demodTask(void *arg) {
                 // ────────────────── DATA ───────────────────────────────
                 case STATE_DATA:
                     if (tone >= 1 && tone <= 8) {
+                        silenceCount = 0;
                         int symVal = tone - 1;
                         pushBits3(symVal);
                         dataCount++;
@@ -431,6 +433,26 @@ static void demodTask(void *arg) {
                             ESP_LOGI(TAG, "All %d symbols received — waiting for postamble", NUM_DATA_SYMS);
                             state     = STATE_POSTAMBLE;
                             postCount = 0;
+                        }
+                    } else if (tone == -1) {
+                        silenceCount++;
+                        // 8 consecutive silent/corrupted symbol slots (~480ms) during DATA -> fast fail!
+                        if (silenceCount >= 8) {
+                            ESP_LOGW(TAG, "⚡ Signal Dropout — 8 consecutive silent symbol slots (~480ms) during DATA");
+                            led_red_on();
+                            buzzer_play_error();
+                            oled_show_error("Signal Lost");
+                            vTaskDelay(pdMS_TO_TICKS(1500));
+                            leds_off();
+                            oled_show_ready();
+
+                            state            = STATE_IDLE;
+                            consecutiveF0    = 0;
+                            postCount        = 0;
+                            dataCount        = 0;
+                            silenceCount     = 0;
+                            skipGuardSamples = 0;
+                            lastF0HitMs      = 0;
                         }
                     }
                     break;
