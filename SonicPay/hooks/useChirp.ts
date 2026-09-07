@@ -41,11 +41,11 @@ const DATA_FREQS = [        // F1–F8 — data tones, index = 3-bit symbol valu
 const SYMBOL_DURATION_MS = 50; // ms per data/sync symbol
 const GUARD_DURATION_MS  = 10; // ms silent guard between symbols
 
-// 70-byte packet → 560 bits → ceil(560/3) = 187, rounded up to 188
+// 70-byte packet → 560 bits → ceil(560/3) = 187 symbols
 const PACKET_BYTES  = 70;
 const TOTAL_BITS    = PACKET_BYTES * 8; // 560
 const BITS_PER_SYM  = 3;
-const NUM_DATA_SYMS = Math.ceil(TOTAL_BITS / BITS_PER_SYM); // 188
+const NUM_DATA_SYMS = Math.ceil(TOTAL_BITS / BITS_PER_SYM); // 187
 
 // ---------------------------------------------------------------------------
 // CRC-16/CCITT — exported so HomeScreen can compute packet CRC
@@ -216,7 +216,7 @@ export function useChirp() {
       const guardSamples = Math.floor(SAMPLE_RATE * GUARD_DURATION_MS  / 1000); // 441
       const slotSamples  = toneSamples + guardSamples;                           // 2646
 
-      const numSlots     = 3 + NUM_DATA_SYMS + 2; // 3 pre + 188 data + 2 post = 193
+      const numSlots     = 6 + NUM_DATA_SYMS + 2; // 6 pre + 187 data + 2 post = 195
       const totalSamples = numSlots * slotSamples;
       const allSamples   = new Float32Array(totalSamples);
 
@@ -229,8 +229,8 @@ export function useChirp() {
         allSamples.set(guard, offset); offset += guard.length;
       };
 
-      // Preamble: 3 × F0 (2050 Hz)
-      for (let p = 0; p < 3; p++) writeSlot(PREAMBLE_FREQ);
+      // Preamble: 6 × F0 (2050 Hz) for robust sync lock
+      for (let p = 0; p < 6; p++) writeSlot(PREAMBLE_FREQ);
 
       // Data: 188 × 8-FSK symbols mapped to F1–F8 (2200–3600 Hz)
       for (const sym of symbols) writeSlot(DATA_FREQS[sym]);
@@ -239,38 +239,53 @@ export function useChirp() {
       for (let p = 0; p < 2; p++) writeSlot(PREAMBLE_FREQ);
 
       const wavBase64 = buildWAV(allSamples, SAMPLE_RATE);
+      console.log(`[SonicPay System Log] WAV generated: ${allSamples.length} samples (${(allSamples.length / SAMPLE_RATE).toFixed(2)}s)`);
 
       // Write WAV to cache and play via expo-audio
       const file = new File(Paths.cache, 'chirp.wav');
       await file.write(wavBase64, { encoding: 'base64' });
+      console.log(`[SonicPay System Log] Saved WAV to cache: ${file.uri}`);
 
       await setAudioModeAsync({
         playsInSilentMode: true,
         allowsRecording:   false,
       });
 
-      const player = createAudioPlayer({ uri: file.uri });
+      let player: any = null;
+      try {
+        player = createAudioPlayer(file.uri);
+      } catch {
+        player = createAudioPlayer({ uri: file.uri });
+      }
       playerRef.current = player;
       player.volume = 1.0;
       player.play();
+      console.log(`[SonicPay System Log] Audio playback started.`);
 
-      // Poll until playback ends (expo-audio doesn't expose an onFinish promise)
+      // Poll until playback actually starts, then poll until it ends
       await new Promise<void>((resolve) => {
+        let hasStarted = false;
+        const startTime = Date.now();
         intervalRef.current = setInterval(() => {
-          if (!player.playing) {
+          if (player.playing) {
+            hasStarted = true;
+          }
+          // If player has started and now stopped, OR if 15 seconds have passed (safety timeout)
+          if ((hasStarted && !player.playing) || (Date.now() - startTime > 15000)) {
             if (intervalRef.current) clearInterval(intervalRef.current);
             intervalRef.current = null;
-            player.remove();
+            try { player.remove(); } catch {}
             playerRef.current = null;
+            console.log(`[SonicPay System Log] Audio playback finished.`);
             resolve();
           }
-        }, 50);
+        }, 100);
       });
-    } catch (err) {
-      console.error('[useChirp] Playback failed:', err);
+    } catch (err: any) {
+      console.error('[SonicPay System Log] Audio playback failed:', err?.message || String(err), err?.stack || '');
       if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
-      if (playerRef.current)   { playerRef.current.remove(); playerRef.current = null; }
-      throw err; // re-throw so HomeScreen can set error state
+      if (playerRef.current)   { try { playerRef.current.remove(); } catch {} playerRef.current = null; }
+      throw err;
     } finally {
       playingRef.current = false;
     }

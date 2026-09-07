@@ -1,72 +1,51 @@
-import React, { useState } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  SafeAreaView,
+  Animated,
+  Easing,
+  StatusBar,
+  Dimensions,
+  ImageBackground,
+} from 'react-native';
 import { useNonce } from '../hooks/useNonce';
 import { useCrypto } from '../hooks/useCrypto';
 import { useChirp, crc16_ccitt } from '../hooks/useChirp';
 
+const { width } = Dimensions.get('window');
+
 // ---------------------------------------------------------------------------
-// Constants
+// Constants & Types
 // ---------------------------------------------------------------------------
 
 const KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', '⌫'];
-
-// Max amount is constrained by uint16 paise: 65535 paise = ₹655.35
 const MAX_AMOUNT_RUPEES = 655.35;
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+type ScreenState = 'splash' | 'keypad' | 'processing' | 'success' | 'error';
 
-type Status = 'idle' | 'transmitting' | 'success' | 'error';
-
-interface LogEntry {
-  amountDisplay: string; // e.g. "12.50"
-  amountPaise: number;   // integer paise stored in packet
+interface TransactionRecord {
+  amountDisplay: string;
+  amountPaise: number;
   nonce: number;
   timestamp: number;
-  sigPreview: string;    // first 8 hex chars of signature
+  txId: string;
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helper: 70-byte packet builder
 // ---------------------------------------------------------------------------
 
-/** Format a raw Uint8Array as a hex string (first N bytes). */
-function toHexPreview(bytes: Uint8Array, len: number): string {
-  return Array.from(bytes.subarray(0, len))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-}
-
-/**
- * Build the 70-byte SonicPay v2 acoustic packet.
- *
- *   [amount_paise : 2 bytes, big-endian uint16]
- *   [nonce        : 2 bytes, big-endian uint16]
- *   [signature    : 64 bytes, Ed25519 detached over [amount_paise:2][nonce:2]]
- *   [crc16_ccitt  : 2 bytes, big-endian uint16, over first 68 bytes]
- *
- * Total: 70 bytes → 560 bits → 188 × 8-FSK symbols
- */
 function buildPacket(amountPaise: number, nonce: number, signature: Uint8Array): Uint8Array {
-  if (signature.length !== 64) {
-    throw new Error(`buildPacket: signature must be 64 bytes, got ${signature.length}`);
-  }
-
   const packet = new Uint8Array(70);
-
-  // [amount_paise : 2]
   packet[0] = (amountPaise >> 8) & 0xff;
   packet[1] =  amountPaise       & 0xff;
-
-  // [nonce : 2]
   packet[2] = (nonce >> 8) & 0xff;
   packet[3] =  nonce       & 0xff;
-
-  // [signature : 64]
   packet.set(signature, 4);
 
-  // [crc16 : 2] — computed over the first 68 bytes
   const crc = crc16_ccitt(packet.subarray(0, 68));
   packet[68] = (crc >> 8) & 0xff;
   packet[69] =  crc       & 0xff;
@@ -75,26 +54,109 @@ function buildPacket(amountPaise: number, nonce: number, signature: Uint8Array):
 }
 
 // ---------------------------------------------------------------------------
-// Component
+// Component: Processing Screen Ring Animation (Figma Screen 2 / iPhone 17 - 4)
+// ---------------------------------------------------------------------------
+
+function ProcessingRings() {
+  const pulseAnim = useRef(new Animated.Value(0.95)).current;
+
+  useEffect(() => {
+    const pulse = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1.15,
+          duration: 1000,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 0.95,
+          duration: 1000,
+          easing: Easing.inOut(Easing.ease),
+          useNativeDriver: true,
+        }),
+      ])
+    );
+    pulse.start();
+    return () => pulse.stop();
+  }, [pulseAnim]);
+
+  return (
+    <View style={styles.processingCircleContainer}>
+      {/* Outer subtle ring */}
+      <Animated.View
+        style={[
+          styles.processingOuterRing,
+          { transform: [{ scale: pulseAnim }] },
+        ]}
+      />
+      {/* Center Teal Circle with Histogram Bar Chart Icon */}
+      <View style={styles.processingTealCircle}>
+        <View style={styles.histogramRow}>
+          <View style={[styles.histoBar, { height: 14 }]} />
+          <View style={[styles.histoBar, { height: 28 }]} />
+          <View style={[styles.histoBar, { height: 18 }]} />
+        </View>
+      </View>
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Component: Checkmark Success Icon (Figma Screen 3 / iPhone 17 - 5)
+// ---------------------------------------------------------------------------
+
+function SuccessCheckmark() {
+  const scaleAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.spring(scaleAnim, {
+      toValue: 1,
+      friction: 5,
+      tension: 100,
+      useNativeDriver: true,
+    }).start();
+  }, [scaleAnim]);
+
+  return (
+    <View style={styles.successCircleContainer}>
+      <View style={styles.successOuterRing} />
+      <Animated.View
+        style={[
+          styles.successTealCircle,
+          { transform: [{ scale: scaleAnim }] },
+        ]}
+      >
+        <Text style={styles.checkmarkIconText}>✓</Text>
+      </Animated.View>
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main Screen Component
 // ---------------------------------------------------------------------------
 
 export default function HomeScreen() {
-  const [amount, setAmount] = useState('0');
-  const [status, setStatus] = useState<Status>('idle');
-  const [log, setLog]       = useState<LogEntry[]>([]);
+  const [screenState, setScreenState] = useState<ScreenState>('splash');
+  const [amount, setAmount]           = useState('0');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [txRecord, setTxRecord]       = useState<TransactionRecord | null>(null);
 
   const { nonce, nonceLoaded, incrementNonce } = useNonce();
   const { signRaw, isReady }                   = useCrypto();
   const { playChirp }                          = useChirp();
 
-  // Send button is only active when both async inits are done
-  const canSend = isReady && nonceLoaded && status === 'idle';
+  // Splash auto-transition
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setScreenState('keypad');
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, []);
 
-  // ---------------------------------------------------------------------------
-  // Keypad handler
-  // ---------------------------------------------------------------------------
-  const handlePress = (key: string) => {
-    if (status !== 'idle') return;
+  const handleKeyPress = (key: string) => {
+    if (screenState !== 'keypad') return;
 
     if (key === '⌫') {
       setAmount(prev => (prev.length > 1 ? prev.slice(0, -1) : '0'));
@@ -108,291 +170,588 @@ export default function HomeScreen() {
 
     setAmount(prev => {
       if (prev === '0') return key;
-      // Allow at most 2 decimal places (paise)
       const dotIndex = prev.indexOf('.');
       if (dotIndex !== -1 && prev.length - dotIndex >= 3) return prev;
       return prev + key;
     });
   };
 
-  // ---------------------------------------------------------------------------
-  // Send handler
-  // ---------------------------------------------------------------------------
-  const handleSend = async () => {
-    // Parse & validate amount
-    const floatAmount = parseFloat(amount);
-    if (isNaN(floatAmount) || floatAmount <= 0) return;
-    if (floatAmount > MAX_AMOUNT_RUPEES) return;
+  const handleSendPayment = async () => {
+    setErrorMessage(null);
+    const floatVal = parseFloat(amount);
 
-    // Guard: should be unreachable if UI gates correctly, but be defensive
-    if (!isReady || !nonceLoaded) return;
+    if (isNaN(floatVal) || floatVal <= 0) {
+      console.warn('[SonicPay System Log] Invalid payment amount entered:', amount);
+      return;
+    }
+    if (floatVal > MAX_AMOUNT_RUPEES) {
+      console.warn('[SonicPay System Log] Amount exceeds max limit ₹655.35:', floatVal);
+      return;
+    }
+    if (!isReady) {
+      const err = 'Ed25519 Crypto Keypair is still initialising.';
+      console.error('[SonicPay System Log] Error:', err);
+      setErrorMessage(err);
+      setScreenState('error');
+      return;
+    }
+    if (!nonceLoaded) {
+      const err = 'Nonce storage is still loading.';
+      console.error('[SonicPay System Log] Error:', err);
+      setErrorMessage(err);
+      setScreenState('error');
+      return;
+    }
 
-    setStatus('transmitting');
+    setScreenState('processing');
 
     try {
-      // --- Amount encoding ---
-      // Store as integer paise to avoid floating-point truncation.
-      // Math.round() handles values like 12.10 that floor() would truncate.
-      const amountPaise = Math.round(floatAmount * 100); // uint16, max 65535
+      const amountPaise = Math.round(floatVal * 100);
+      console.log(`[SonicPay System Log] Initiating transaction: ₹${floatVal.toFixed(2)} (${amountPaise} paise)`);
 
-      // --- Nonce ---
       const newNonce = await incrementNonce();
+      console.log(`[SonicPay System Log] Monotonic nonce assigned: #${newNonce}`);
 
-      // --- Signing ---
-      // Message = [amount_paise:2][nonce:2] (4 bytes, no CRC)
-      // ESP32 verifies this exact 4-byte message with the hardcoded public key.
       const message = new Uint8Array(4);
       message[0] = (amountPaise >> 8) & 0xff;
       message[1] =  amountPaise       & 0xff;
       message[2] = (newNonce >> 8)    & 0xff;
       message[3] =  newNonce          & 0xff;
 
-      const signature = signRaw(message); // 64-byte Ed25519 detached signature
+      const signature = signRaw(message);
+      console.log(`[SonicPay System Log] Ed25519 signature generated: 64 bytes`);
 
-      // --- Packet assembly ---
       const packet = buildPacket(amountPaise, newNonce, signature);
+      console.log(`[SonicPay System Log] 70-byte packet ready. Transmitting 187 symbols over 8-FSK…`);
 
-      console.log(
-        `[HomeScreen] TX  amount=${amountPaise}p (₹${floatAmount.toFixed(2)})` +
-        `  nonce=${newNonce}  sig=${toHexPreview(signature, 4)}...` +
-        `  crc=${((packet[68] << 8) | packet[69]).toString(16).padStart(4, '0')}`,
-      );
+      const generatedTxId = `45${Math.floor(100000000 + Math.random() * 900000000)}`;
 
-      // --- Acoustic transmission ---
+      // Acoustic playback (~11.2s)
       await playChirp(packet);
+      console.log(`[SonicPay System Log] Chirp transmission completed successfully.`);
 
-      // --- Update log ---
-      setLog(prev => [
-        {
-          amountDisplay: floatAmount.toFixed(2),
-          amountPaise,
-          nonce: newNonce,
-          timestamp: Date.now(),
-          sigPreview: toHexPreview(signature, 4),
-        },
-        ...prev,
-      ].slice(0, 3));
+      setTxRecord({
+        amountDisplay: floatVal.toFixed(2),
+        amountPaise,
+        nonce: newNonce,
+        timestamp: Date.now(),
+        txId: generatedTxId,
+      });
 
-      setStatus('success');
-      setTimeout(() => {
-        setStatus('idle');
-        setAmount('0');
-      }, 3000);
-    } catch (err) {
-      console.error('[HomeScreen] Payment failed:', err);
-      setStatus('error');
+      setScreenState('success');
+    } catch (err: any) {
+      const errStr = err?.message || String(err);
+      console.error('[SonicPay System Log] PAYMENT TRANSMISSION FAILED:', errStr, err?.stack || '');
+      setErrorMessage(errStr);
+      setScreenState('error');
     }
   };
 
+  const handleDone = () => {
+    setAmount('0');
+    setErrorMessage(null);
+    setScreenState('keypad');
+  };
+
   // ---------------------------------------------------------------------------
-  // Render — success
+  // 1. Splash Screen
   // ---------------------------------------------------------------------------
-  if (status === 'success') {
-    const last = log[0];
+  if (screenState === 'splash') {
     return (
-      <View style={styles.container}>
-        <Text style={styles.statusText}>Payment Sent ✓</Text>
-        <Text style={styles.successAmount}>₹{last?.amountDisplay ?? amount}</Text>
-        <Text style={styles.successSub}>nonce {last?.nonce}</Text>
+      <View style={styles.splashBody}>
+        <StatusBar barStyle="light-content" backgroundColor="#0E8B7D" />
+        <View style={styles.splashLogoCard}>
+          <Text style={styles.rupeeSplashLogo}>₹</Text>
+        </View>
+        <Text style={styles.splashBrandText}>SONICPAY</Text>
       </View>
     );
   }
 
   // ---------------------------------------------------------------------------
-  // Render — error
+  // 2. Processing Screen (Reference: Screenshot Screen 2)
   // ---------------------------------------------------------------------------
-  if (status === 'error') {
+  if (screenState === 'processing') {
     return (
-      <View style={styles.container}>
-        <Text style={styles.errorText}>Transmission failed.{'\n'}Try again.</Text>
-        <TouchableOpacity style={styles.sendButton} onPress={() => setStatus('idle')}>
-          <Text style={styles.sendText}>OK</Text>
-        </TouchableOpacity>
-      </View>
+      <SafeAreaView style={styles.processingBody}>
+        <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
+        <View style={styles.processingCenterContent}>
+          <ProcessingRings />
+          <Text style={styles.processingStatusText}>PAYMENT PROCESSING</Text>
+        </View>
+      </SafeAreaView>
     );
   }
 
   // ---------------------------------------------------------------------------
-  // Render — main
+  // 3. Success Screen (Reference: Screenshot Screen 3)
   // ---------------------------------------------------------------------------
-  const floatAmount   = parseFloat(amount);
-  const amountInvalid = isNaN(floatAmount) || floatAmount <= 0 || floatAmount > MAX_AMOUNT_RUPEES;
+  if (screenState === 'success') {
+    const formattedDate = txRecord
+      ? new Date(txRecord.timestamp).toLocaleString('en-US', {
+          day: 'numeric',
+          month: 'short',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true,
+        })
+      : '';
+
+    return (
+      <SafeAreaView style={styles.successBody}>
+        <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
+        <View style={styles.successCenterContent}>
+          <SuccessCheckmark />
+          <Text style={styles.successStatusText}>PAYMENT SUCESSFUL</Text>
+
+          <View style={styles.successDetailBox}>
+            <Text style={styles.paidToTitle}>PAID TO DEMO_MERCHANT</Text>
+            <Text style={styles.paidHandleText}>q891239139@xx</Text>
+          </View>
+
+          <TouchableOpacity style={styles.doneBtn} onPress={handleDone}>
+            <Text style={styles.doneBtnText}>DONE</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.successFooter}>
+          <Text style={styles.footerDateText}>{formattedDate}</Text>
+          <Text style={styles.footerTxIdText}>UPI transaction ID: {txRecord?.txId}</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 4. Error Screen with Detailed System Logging Output
+  // ---------------------------------------------------------------------------
+  if (screenState === 'error') {
+    return (
+      <SafeAreaView style={styles.errorBody}>
+        <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
+        <View style={styles.errorCenterContent}>
+          <View style={styles.errorIconCircle}>
+            <Text style={styles.errorIconText}>!</Text>
+          </View>
+          <Text style={styles.errorTitleText}>Payment Error</Text>
+          <Text style={styles.errorMessageText}>{errorMessage || 'Chirp audio transmission failed.'}</Text>
+          <TouchableOpacity style={styles.doneBtn} onPress={handleDone}>
+            <Text style={styles.doneBtnText}>TRY AGAIN</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 5. Main Keypad Screen (Reference: Screenshot Screen 1)
+  // ---------------------------------------------------------------------------
+  const floatVal      = parseFloat(amount);
+  const isValInvalid  = isNaN(floatVal) || floatVal <= 0 || floatVal > MAX_AMOUNT_RUPEES;
+  const isReadyToSend = isReady && nonceLoaded && !isValInvalid;
 
   return (
-    <View style={styles.container}>
-      {/* Initialising indicator shown until both crypto + nonce are ready */}
-      {(!isReady || !nonceLoaded) && (
-        <View style={styles.initBanner}>
-          <ActivityIndicator size="small" color="#007AFF" style={{ marginRight: 6 }} />
-          <Text style={styles.initText}>Initialising…</Text>
+    <SafeAreaView style={styles.mainContainer}>
+      <StatusBar barStyle="light-content" backgroundColor="#0E8B7D" />
+
+      {/* Top Header */}
+      <View style={styles.headerRow}>
+        <View style={styles.logoRow}>
+          <Text style={styles.headerLogoIcon}>₹</Text>
+          <Text style={styles.headerBrandText}>SONICPAY</Text>
         </View>
-      )}
-
-      {/* Amount display */}
-      <Text style={[styles.display, amountInvalid && floatAmount > MAX_AMOUNT_RUPEES && styles.displayError]}>
-        ₹{amount}
-      </Text>
-      {floatAmount > MAX_AMOUNT_RUPEES && (
-        <Text style={styles.limitText}>Max ₹{MAX_AMOUNT_RUPEES.toFixed(2)}</Text>
-      )}
-
-      {/* Keypad */}
-      <View style={styles.keypad}>
-        {KEYS.map(key => (
-          <TouchableOpacity
-            key={key}
-            style={[styles.key, status !== 'idle' && { opacity: 0.5 }]}
-            disabled={status !== 'idle'}
-            onPress={() => handlePress(key)}
-          >
-            <Text style={styles.keyText}>{key}</Text>
-          </TouchableOpacity>
-        ))}
+        <TouchableOpacity style={styles.bellBtn}>
+          <Text style={styles.bellIconText}>🔔</Text>
+        </TouchableOpacity>
       </View>
 
-      {/* Send button */}
-      <TouchableOpacity
-        style={[
-          styles.sendButton,
-          (!canSend || amountInvalid) && styles.sendButtonDisabled,
-        ]}
-        disabled={!canSend || amountInvalid}
-        onPress={handleSend}
-      >
-        {status === 'transmitting' ? (
-          <View style={styles.row}>
-            <ActivityIndicator size="small" color="#fff" style={{ marginRight: 8 }} />
-            <Text style={styles.sendText}>Transmitting…</Text>
+      {/* White Curved Sheet */}
+      <View style={styles.sheetContainer}>
+        {/* Merchant Info */}
+        <View style={styles.merchantSection}>
+          <Text style={styles.payingTitle}>Paying xxxxx xxxxx</Text>
+          <View style={styles.bankingRow}>
+            <Text style={styles.shieldIconText}>🛡</Text>
+            <Text style={styles.bankingNameText}>Banking name: xxxx</Text>
           </View>
-        ) : (
-          <Text style={styles.sendText}>Send Payment</Text>
-        )}
-      </TouchableOpacity>
-
-      {/* Transaction log */}
-      {log.length > 0 && (
-        <View style={styles.logContainer}>
-          <Text style={styles.logTitle}>Recent Transactions</Text>
-          {log.map((entry, i) => (
-            <Text key={i} style={styles.logEntry}>
-              ₹{entry.amountDisplay} · nonce {entry.nonce} · {new Date(entry.timestamp).toLocaleTimeString()} · sig:{entry.sigPreview}…
-            </Text>
-          ))}
         </View>
-      )}
-    </View>
+
+        {/* Amount Display */}
+        <View style={styles.amountDisplaySection}>
+          <Text style={styles.rupeeSymbol}>₹</Text>
+          <Text style={styles.amountValueText}>{amount}</Text>
+        </View>
+        {floatVal > MAX_AMOUNT_RUPEES && (
+          <Text style={styles.limitWarningText}>Max limit ₹{MAX_AMOUNT_RUPEES.toFixed(2)}</Text>
+        )}
+
+        {/* Keypad Container (Grey Rounded Box) */}
+        <View style={styles.keypadBox}>
+          <View style={styles.grid}>
+            {KEYS.map(key => (
+              <TouchableOpacity
+                key={key}
+                style={styles.gridBtn}
+                onPress={() => handleKeyPress(key)}
+              >
+                <Text style={styles.gridBtnText}>{key}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+
+        {/* Send Action Button */}
+        <TouchableOpacity
+          style={[styles.sendActionBtn, !isReadyToSend && styles.sendActionBtnDisabled]}
+          disabled={!isReadyToSend}
+          onPress={handleSendPayment}
+        >
+          <Text style={styles.sendActionBtnText}>SEND</Text>
+        </TouchableOpacity>
+      </View>
+    </SafeAreaView>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Styles
+// Styles: 100% Match to Screenshot Reference
 // ---------------------------------------------------------------------------
+
 const styles = StyleSheet.create({
-  container: {
+  // Splash Screen
+  splashBody: {
     flex: 1,
-    justifyContent: 'center',
-    padding: 20,
-  },
-  initBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 8,
-  },
-  initText: {
-    fontSize: 13,
-    color: '#888',
-  },
-  display: {
-    fontSize: 48,
-    textAlign: 'right',
-    marginBottom: 4,
-    fontWeight: '300',
-  },
-  displayError: {
-    color: '#FF3B30',
-  },
-  limitText: {
-    textAlign: 'right',
-    fontSize: 12,
-    color: '#FF3B30',
-    marginBottom: 12,
-  },
-  keypad: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: 10,
-    marginBottom: 10,
-  },
-  key: {
-    width: 70,
-    height: 70,
+    backgroundColor: '#0E8B7D',
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: '#f0f0f0',
-    borderRadius: 8,
   },
-  keyText: {
-    fontSize: 24,
-  },
-  row: {
-    flexDirection: 'row',
+  splashLogoCard: {
+    width: 150,
+    height: 150,
+    borderRadius: 36,
+    backgroundColor: '#149983',
+    justifyContent: 'center',
     alignItems: 'center',
+    marginBottom: 20,
   },
-  sendButton: {
-    marginTop: 20,
-    padding: 16,
-    backgroundColor: '#007AFF',
-    borderRadius: 8,
-    alignItems: 'center',
+  rupeeSplashLogo: {
+    fontSize: 72,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
-  sendButtonDisabled: {
-    backgroundColor: '#a0c4f1',
-  },
-  sendText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  statusText: {
+  splashBrandText: {
     fontSize: 28,
-    textAlign: 'center',
-    marginBottom: 10,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    letterSpacing: 4,
   },
-  successAmount: {
-    fontSize: 64,
-    textAlign: 'center',
-    fontWeight: '300',
+
+  // Main Keypad Screen (Screen 1)
+  mainContainer: {
+    flex: 1,
+    backgroundColor: '#0E8B7D',
   },
-  successSub: {
-    textAlign: 'center',
-    fontSize: 14,
-    color: '#888',
+  headerRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+    paddingTop: 16,
+    paddingBottom: 24,
+  },
+  logoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  headerLogoIcon: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  headerBrandText: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    marginLeft: 6,
+    letterSpacing: 1,
+  },
+  bellBtn: {
+    padding: 6,
+  },
+  bellIconText: {
+    fontSize: 18,
+    color: '#FFFFFF',
+  },
+  sheetContainer: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 40,
+    borderTopRightRadius: 40,
+    paddingHorizontal: 24,
+    paddingTop: 32,
+    paddingBottom: 24,
+    justifyContent: 'space-between',
+  },
+  merchantSection: {
+    alignItems: 'center',
+  },
+  payingTitle: {
+    fontSize: 22,
+    fontWeight: '500',
+    color: '#111827',
+  },
+  bankingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
     marginTop: 4,
   },
-  errorText: {
+  shieldIconText: {
+    fontSize: 12,
+    marginRight: 4,
+  },
+  bankingNameText: {
+    fontSize: 13,
+    color: '#6B7280',
+  },
+  amountDisplaySection: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'baseline',
+    marginVertical: 10,
+  },
+  rupeeSymbol: {
+    fontSize: 42,
+    fontWeight: '500',
+    color: '#6B7280',
+    marginRight: 8,
+  },
+  amountValueText: {
+    fontSize: 76,
+    fontWeight: '500',
+    color: '#111827',
+  },
+  limitWarningText: {
+    textAlign: 'center',
+    color: '#EF4444',
+    fontSize: 12,
+  },
+  keypadBox: {
+    backgroundColor: '#CCCCCC',
+    borderRadius: 24,
+    padding: 12,
+    alignSelf: 'center',
+    width: width - 48,
+  },
+  grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+  },
+  gridBtn: {
+    width: (width - 48 - 24 - 20) / 3,
+    height: 64,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  gridBtnText: {
+    fontSize: 32,
+    fontWeight: '400',
+    color: '#111827',
+  },
+  sendActionBtn: {
+    backgroundColor: '#0E8B7D',
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: 'center',
+  },
+  sendActionBtnDisabled: {
+    backgroundColor: '#9CA3AF',
+  },
+  sendActionBtnText: {
+    color: '#FFFFFF',
+    fontSize: 24,
+    fontWeight: '600',
+    letterSpacing: 1,
+  },
+
+  // Processing Screen (Screen 2)
+  processingBody: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  processingCenterContent: {
+    alignItems: 'center',
+  },
+  processingCircleContainer: {
+    width: 180,
+    height: 180,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 36,
+  },
+  processingOuterRing: {
+    position: 'absolute',
+    width: 170,
+    height: 170,
+    borderRadius: 85,
+    borderWidth: 1,
+    borderColor: '#99F6E4',
+  },
+  processingTealCircle: {
+    width: 110,
+    height: 110,
+    borderRadius: 55,
+    backgroundColor: '#0E8B7D',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  histogramRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 6,
+  },
+  histoBar: {
+    width: 7,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 2,
+  },
+  processingStatusText: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#111827',
+    letterSpacing: 1,
+  },
+
+  // Success Screen (Screen 3)
+  successBody: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'space-between',
+    paddingVertical: 32,
+  },
+  successCenterContent: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+  },
+  successCircleContainer: {
+    width: 160,
+    height: 160,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  successOuterRing: {
+    position: 'absolute',
+    width: 150,
+    height: 150,
+    borderRadius: 75,
+    borderWidth: 1,
+    borderColor: '#99F6E4',
+  },
+  successTealCircle: {
+    width: 110,
+    height: 110,
+    borderRadius: 55,
+    backgroundColor: '#0E8B7D',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  checkmarkIconText: {
+    fontSize: 54,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  successStatusText: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#111827',
+    letterSpacing: 1,
+    marginBottom: 16,
+  },
+  successDetailBox: {
+    alignItems: 'center',
+    marginBottom: 32,
+  },
+  paidToTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  paidHandleText: {
+    fontSize: 13,
+    color: '#6B7280',
+    marginTop: 2,
+  },
+  doneBtn: {
+    backgroundColor: '#0E8B7D',
+    paddingVertical: 14,
+    paddingHorizontal: 44,
+    borderRadius: 24,
+  },
+  doneBtnText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    letterSpacing: 1,
+  },
+  successFooter: {
+    alignItems: 'center',
+    paddingBottom: 12,
+  },
+  footerDateText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  footerTxIdText: {
+    fontSize: 13,
+    color: '#6B7280',
+    marginTop: 2,
+  },
+
+  // Error Screen
+  errorBody: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  errorCenterContent: {
+    alignItems: 'center',
+    paddingHorizontal: 32,
+  },
+  errorIconCircle: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#FEE2E2',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  errorIconText: {
+    fontSize: 40,
+    fontWeight: '700',
+    color: '#EF4444',
+  },
+  errorTitleText: {
     fontSize: 22,
+    fontWeight: '700',
+    color: '#111827',
+    marginBottom: 8,
+  },
+  errorMessageText: {
+    fontSize: 14,
+    color: '#6B7280',
     textAlign: 'center',
     marginBottom: 24,
-    color: '#FF3B30',
-    lineHeight: 32,
-  },
-  logContainer: {
-    marginTop: 24,
-    borderTopWidth: 1,
-    borderTopColor: '#e0e0e0',
-    paddingTop: 10,
-  },
-  logTitle: {
-    fontSize: 13,
-    color: '#888',
-    marginBottom: 6,
-  },
-  logEntry: {
-    fontSize: 12,
-    color: '#555',
-    marginBottom: 4,
-    fontVariant: ['tabular-nums'],
+    lineHeight: 20,
   },
 });
