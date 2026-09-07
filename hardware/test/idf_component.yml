@@ -1,0 +1,3 @@
+## No managed component registry entry for u8g2.
+## u8g2 is vendored in components/u8g2/ (cloned from https://github.com/olikraus/u8g2).
+dependencies: {}

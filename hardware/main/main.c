@@ -10,8 +10,20 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
+#include "monocypher.h"
+#include "peripherals.h"
+#include "ledger.h"
 
 #define TAG         "SonicPay"
+
+// Hardcoded Ed25519 Public Key for SonicPay Terminal Verification
+// (Matches the public key generated / used by the phone app)
+static const uint8_t MERCHANT_PUBLIC_KEY[32] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
 #define MIC_CHANNEL ADC_CHANNEL_6
 #define ADC_REQUEST_RATE 44100
 #define DECODE_RATE      36096
@@ -31,7 +43,7 @@
 //   F8 = 3600 Hz  — data value 7  (bits 111)
 //
 // Packet: [amount_paise:2][nonce:2][signature:64][crc:2] = 70 bytes = 560 bits
-// 8-FSK: 3 bits/sym → ceil(560/3) = 188 data symbols
+// 8-FSK: 3 bits/sym → ceil(560/3) = 187 data symbols
 // Symbol: 50 ms  |  Guard: 10 ms  |  Sample rate: 36096 Hz
 // Samples/symbol: 36096 * 0.05 = 1804
 // Samples/guard:  36096 * 0.01 = 360
@@ -42,14 +54,21 @@
 #define SYMBOL_SAMPLES     (DECODE_RATE * SYMBOL_DURATION_MS / 1000)  // 1804
 #define GUARD_SAMPLES      (DECODE_RATE * GUARD_DURATION_MS  / 1000)  // 360
 
-#define PREAMBLE_SYMS       3
+#define PREAMBLE_SYMS       5     // Require 5 consecutive F0 hits (300ms) to lock preamble
 #define POSTAMBLE_SYMS      2
-#define NUM_DATA_SYMS       188   // ceil(560 / 3)
+#define NUM_DATA_SYMS       187   // ceil(560 / 3) = 187 symbols for 70 bytes
 #define MAX_PAYLOAD_BYTES   128   // 70 bytes needed; headroom for debug
 
-#define PREAMBLE_SNR_THRESHOLD  5.0f   // F0 is lower-freq; separate from data threshold
-#define DATA_SNR_THRESHOLD      50.0f  // Real tones: SNR 85–2584; ambient noise: SNR 3–107
-#define IDLE_TIMEOUT_MS         3000   // 188 syms × 60ms = 11.28s; timeout must be >> that
+// Dynamic Thresholds
+#define PREAMBLE_SNR_THRESHOLD  45.0f   // Above ambient (~43-51 SNR) — requires real phone chirp (80-380+)
+#define DATA_SNR_THRESHOLD       6.0f   // Sensitive reception during data decoding
+#define MIN_POWER_THRESHOLD     1e6f   // Minimum power gate
+
+// Preamble consecutive-hit timeout guard (500 ms = ~8 symbol slots)
+#define PREAMBLE_HIT_TIMEOUT_MS  500
+
+// Idle flush timeout (3 seconds)
+#define IDLE_TIMEOUT_MS  3000
 
 static const float TARGET_FREQS[NUM_TONES] = {
     2050,  // Tone 0: 2.050 kHz (Dedicated Sync — preamble + postamble)
@@ -102,7 +121,7 @@ static void initHardware(void) {
     ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &dig_cfg));
     ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
 
-    ESP_LOGI(TAG, "Hardware ready — 8-FSK 2050–3600 Hz, 50ms symbols, 36096 Hz ADC");
+    ESP_LOGI(TAG, "ADC hardware ready (36096 Hz continuous)");
 }
 
 // ── Goertzel ──────────────────────────────────────────────────────
@@ -120,8 +139,7 @@ static float goertzel(int16_t *buf, int len, float freq, float sr) {
 }
 
 // ── Detect dominant tone ──────────────────────────────────────────
-// Returns 0–8 (index into TARGET_FREQS) or -1 if no clear tone.
-static int detectToneFull(int16_t *buf, int len, float *out_maxPower, float *out_snr) {
+static int detectToneFull(int16_t *buf, int len, float *out_maxPower, float *out_snr, float minPower, float minSnr) {
     float powers[NUM_TONES];
     float maxPower = 0;
     float sumPower = 0;
@@ -142,8 +160,8 @@ static int detectToneFull(int16_t *buf, int len, float *out_maxPower, float *out
     if (out_maxPower) *out_maxPower = maxPower;
     if (out_snr)      *out_snr      = snr;
 
-    if (maxPower < 1e6f) return -1;
-    if (snr < DATA_SNR_THRESHOLD) return -1;
+    if (maxPower < minPower) return -1;
+    if (snr < minSnr) return -1;
     return maxIdx;
 }
 
@@ -158,8 +176,6 @@ static void resetPayload(void) {
     payloadBytes = 0;
 }
 
-// Push 3 bits from an 8-FSK symbol (MSB first).
-// symbolVal: 0–7 (maps to bits 000–111).
 static void pushBits3(int symbolVal) {
     for (int bit = 2; bit >= 0; bit--) {
         int b       = (symbolVal >> bit) & 1;
@@ -186,15 +202,9 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
 }
 
 // ── Packet processor ─────────────────────────────────────────────
-// Packet layout (70 bytes):
-//   [0–1]   amount_paise  : uint16 big-endian (divide by 100 → rupees)
-//   [2–3]   nonce         : uint16 big-endian
-//   [4–67]  Ed25519 sig   : 64 bytes (verified in Piece 4 with Monocypher)
-//   [68–69] CRC-16/CCITT  : uint16 big-endian, over bytes 0–67
 static void processPayload(void) {
     ESP_LOGI(TAG, "=== Transmission complete: %d bits / %d bytes ===", payloadBits, payloadBytes);
 
-    // Dump raw hex for debugging
     printf("RAW BYTES: ");
     for (int k = 0; k < payloadBytes && k < MAX_PAYLOAD_BYTES; k++) {
         printf("%02X ", payloadBuf[k]);
@@ -203,49 +213,90 @@ static void processPayload(void) {
 
     if (payloadBytes < 70) {
         ESP_LOGW(TAG, "Short packet (%d / 70 bytes) — ignoring", payloadBytes);
+        led_red_on();
+        buzzer_play_error();
+        oled_show_error("Short Packet");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        leds_off();
+        oled_show_ready();
         return;
     }
 
     uint16_t amountPaise = ((uint16_t)payloadBuf[0] << 8) | payloadBuf[1];
     uint16_t nonce       = ((uint16_t)payloadBuf[2] << 8) | payloadBuf[3];
-    // bytes [4..67] = Ed25519 signature (64 bytes) — verified in Piece 4
     uint16_t rxCrc       = ((uint16_t)payloadBuf[68] << 8) | payloadBuf[69];
-    uint16_t calCrc      = crc16_ccitt(payloadBuf, 68);  // CRC over first 68 bytes
+    uint16_t calCrc      = crc16_ccitt(payloadBuf, 68);
 
-    // ── CRC check ──────────────────────────────────────────────────
     if (rxCrc != calCrc) {
         ESP_LOGW(TAG, "CRC mismatch (rx=0x%04X calc=0x%04X) — packet discarded", rxCrc, calCrc);
+        led_red_on();
+        buzzer_play_error();
+        oled_show_error("CRC Error");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        leds_off();
+        oled_show_ready();
         return;
     }
 
     // ── Ed25519 signature verify ────────────────────────────────────
-    // TODO(Piece 4): call crypto_eddsa_check() with Monocypher here.
-    // For now, log the signature bytes so we can confirm they arrive correctly.
-    ESP_LOGI(TAG, "Signature (first 8 bytes): "
-             "%02X%02X%02X%02X %02X%02X%02X%02X ...",
-             payloadBuf[4],  payloadBuf[5],  payloadBuf[6],  payloadBuf[7],
-             payloadBuf[8],  payloadBuf[9],  payloadBuf[10], payloadBuf[11]);
+    const uint8_t *msg = payloadBuf;        // first 4 bytes
+    const uint8_t *sig = payloadBuf + 4;    // 64-byte signature
+    
+    int sigStatus = crypto_ed25519_check(sig, MERCHANT_PUBLIC_KEY, msg, 4);
 
-    // Amount is stored as integer paise; divide by 100 for display.
     uint32_t rupees = amountPaise / 100;
     uint32_t paise  = amountPaise % 100;
 
+    if (sigStatus != 0) {
+        ESP_LOGW(TAG, "❌ SIGNATURE VERIFICATION FAILED!");
+        led_red_on();
+        buzzer_play_error();
+        oled_show_error("Invalid Sig");
+        vTaskDelay(pdMS_TO_TICKS(2500));
+        leds_off();
+        oled_show_ready();
+        return;
+    }
+
+    // ── Replay attack check (SPIFFS ledger) ─────────────────────────
+    if (ledger_contains_nonce(nonce)) {
+        ESP_LOGW(TAG, "⚠️ REPLAY ATTACK DETECTED — Nonce #%u already processed", nonce);
+        led_red_on();
+        buzzer_play_error();
+        oled_show_replay_error(nonce);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        leds_off();
+        oled_show_ready();
+        return;
+    }
+
+    // ── Record transaction & give Success feedback ──────────────────
+    ledger_add_entry(nonce, amountPaise);
+
     ESP_LOGI(TAG, "=================================================");
-    ESP_LOGI(TAG, "  ✅ CRC16 VALID (sig verify pending Piece 4)    ");
+    ESP_LOGI(TAG, "  ✅ TRANSACTION APPROVED & RECORDED!            ");
     ESP_LOGI(TAG, "  💰 AMOUNT : ₹%"PRIu32".%02"PRIu32"  (%u paise)  ", rupees, paise, amountPaise);
     ESP_LOGI(TAG, "  🔢 NONCE  : #%u                                ", nonce);
     ESP_LOGI(TAG, "=================================================");
+
+    led_green_on();
+    oled_show_success(rupees, paise, nonce);
+    buzzer_play_success();
+
+    vTaskDelay(pdMS_TO_TICKS(3500));
+    leds_off();
+    oled_show_ready();
 }
 
 // ── Demod task ────────────────────────────────────────────────────
 static void demodTask(void *arg) {
-    DemodState state             = STATE_IDLE;
-    int        consecutiveF0     = 0;
-    int        postCount         = 0;
-    int        dataCount         = 0;
-    int        silenceCount      = 0;
-    int64_t    lastSymbolTimeMs  = 0;
+    DemodState state              = STATE_IDLE;
+    int        consecutiveF0      = 0;
+    int        postCount          = 0;
+    int        dataCount          = 0;
+    int64_t    lastSymbolTimeMs   = 0;
     int64_t    preambleLockTimeMs = 0;
+    int64_t    lastF0HitMs        = 0;
 
     esp_task_wdt_add(NULL);
     ESP_LOGI(TAG, "Demod running — waiting for preamble (F0 = 2050 Hz)...");
@@ -264,23 +315,21 @@ static void demodTask(void *arg) {
 
         int64_t nowMs = esp_timer_get_time() / 1000;
 
-        // Idle timeout: if we haven't seen a symbol in a long time, flush.
-        // Timeout must exceed full transmission: 193 slots × 60ms ≈ 11.6s → use 3000ms
-        // (this only fires if we're in mid-decode and the phone drops out)
         if (state != STATE_IDLE && (nowMs - lastSymbolTimeMs) > IDLE_TIMEOUT_MS) {
             if (dataCount > 0) {
-                ESP_LOGW(TAG, "Timeout mid-decode (%d symbols) — processing partial packet", dataCount);
+                ESP_LOGW(TAG, "Idle timeout — flushing (%d symbols received)", dataCount);
                 processPayload();
             } else {
-                ESP_LOGW(TAG, "Timeout — flushing to IDLE");
+                ESP_LOGW(TAG, "Idle timeout — flushing to IDLE (no data)");
+                oled_show_ready();
             }
             state             = STATE_IDLE;
             consecutiveF0     = 0;
             postCount         = 0;
             dataCount         = 0;
-            silenceCount      = 0;
             skipGuardSamples  = 0;
             sampleIdx         = 0;
+            lastF0HitMs       = 0;
         }
 
         adc_digi_output_data_t *p     = (adc_digi_output_data_t *)rx_buf;
@@ -289,28 +338,37 @@ static void demodTask(void *arg) {
         for (uint32_t i = 0; i < count; i++) {
             if (p[i].type1.channel != MIC_CHANNEL) continue;
 
-            // Skip guard-gap samples (10ms silence between symbols)
             if (skipGuardSamples > 0) {
                 skipGuardSamples--;
                 continue;
             }
 
-            // Accumulate into symbol buffer (zero-centred)
             symbolBuf[sampleIdx++] = (int16_t)((int)p[i].type1.data - 2048);
 
-            if (sampleIdx < SYMBOL_SAMPLES) continue;  // not full yet
+            if (sampleIdx < SYMBOL_SAMPLES) continue;
 
-            // Full symbol window captured — reset for next slot
             sampleIdx        = 0;
             lastSymbolTimeMs = esp_timer_get_time() / 1000;
-            skipGuardSamples = GUARD_SAMPLES;
 
-            // Work on a local copy so the main buffer is free immediately
+            // Only skip guard gaps AFTER preamble lock is established!
+            // In IDLE/PREAMBLE, skipping 10ms gaps phase-shifts the window and drops preamble hits.
+            if (state == STATE_DATA || state == STATE_POSTAMBLE) {
+                skipGuardSamples = GUARD_SAMPLES;
+            } else {
+                skipGuardSamples = 0;
+            }
+
             static int16_t localBuf[SYMBOL_SAMPLES];
             memcpy(localBuf, symbolBuf, sizeof(localBuf));
 
             float rawPower = 0, rawSnr = 0;
-            int   tone     = detectToneFull(localBuf, SYMBOL_SAMPLES, &rawPower, &rawSnr);
+            // Two-Stage Thresholds:
+            // - IDLE/PREAMBLE: Power 1e6, SNR 30.0 -> Locks reliably on phone speaker at 15cm
+            // - DATA: Power 1e4, SNR 6.0 -> Sensitive reception for all 187 data symbols
+            float minPwr = (state == STATE_IDLE || state == STATE_PREAMBLE) ? 1e6f : 1e4f;
+            float minSnr = (state == STATE_IDLE || state == STATE_PREAMBLE) ? 30.0f : 6.0f;
+
+            int tone = detectToneFull(localBuf, SYMBOL_SAMPLES, &rawPower, &rawSnr, minPwr, minSnr);
 
             switch (state) {
 
@@ -318,26 +376,36 @@ static void demodTask(void *arg) {
                 case STATE_IDLE:
                 case STATE_PREAMBLE:
                     if (tone == 0 && rawSnr >= PREAMBLE_SNR_THRESHOLD) {
+                        if (consecutiveF0 > 0 &&
+                            (lastSymbolTimeMs - lastF0HitMs) > PREAMBLE_HIT_TIMEOUT_MS) {
+                            ESP_LOGW(TAG, "Preamble gap too large (%lld ms) — resetting counter",
+                                     (long long)(lastSymbolTimeMs - lastF0HitMs));
+                            consecutiveF0 = 0;
+                        }
                         consecutiveF0++;
+                        lastF0HitMs = lastSymbolTimeMs;
+
                         ESP_LOGI(TAG, "Preamble F0 hit %d/%d (SNR=%.1f, pwr=%.0f)",
                                  consecutiveF0, PREAMBLE_SYMS, rawSnr, rawPower);
+
                         if (consecutiveF0 >= PREAMBLE_SYMS) {
-                            ESP_LOGI(TAG, "🔒 Preamble locked — decoding 188 × 8-FSK symbols");
+                            ESP_LOGI(TAG, "🔒 Preamble locked — decoding 187 × 8-FSK symbols");
                             state              = STATE_DATA;
                             consecutiveF0      = 0;
                             dataCount          = 0;
                             postCount          = 0;
-                            silenceCount       = 0;
                             preambleLockTimeMs = lastSymbolTimeMs;
+                            lastF0HitMs        = 0;
                             resetPayload();
+                            oled_show_listening();
                         } else {
                             state = STATE_PREAMBLE;
                         }
                     } else if (tone == -1) {
-                        // brief silence / ambient noise — stay put, don't reset
+                        // Silence / dropout
                     } else {
-                        // Wrong tone while waiting for preamble
                         consecutiveF0 = 0;
+                        lastF0HitMs   = 0;
                         state         = STATE_IDLE;
                     }
                     break;
@@ -345,8 +413,7 @@ static void demodTask(void *arg) {
                 // ────────────────── DATA ───────────────────────────────
                 case STATE_DATA:
                     if (tone >= 1 && tone <= 8) {
-                        silenceCount = 0;
-                        int symVal   = tone - 1;   // 0–7 maps to F1–F8
+                        int symVal = tone - 1;
                         pushBits3(symVal);
                         dataCount++;
                         ESP_LOGI(TAG, "Symbol %3d/%d +%lldms: 8-FSK val=%d bits=%d%d%d (F%d=%.0fHz snr=%.1f)",
@@ -355,28 +422,17 @@ static void demodTask(void *arg) {
                                  symVal,
                                  (symVal >> 2) & 1, (symVal >> 1) & 1, symVal & 1,
                                  tone, TARGET_FREQS[tone], rawSnr);
+
+                        if (dataCount % 20 == 0 || dataCount == NUM_DATA_SYMS) {
+                            oled_show_receiving(dataCount, NUM_DATA_SYMS);
+                        }
+
                         if (dataCount >= NUM_DATA_SYMS) {
                             ESP_LOGI(TAG, "All %d symbols received — waiting for postamble", NUM_DATA_SYMS);
                             state     = STATE_POSTAMBLE;
                             postCount = 0;
                         }
-                    } else if (tone == -1) {
-                        // Silent slot — can be dropout or end-of-transmission
-                        if (dataCount > 0) {
-                            silenceCount++;
-                            if (silenceCount >= 3) {
-                                ESP_LOGW(TAG, "3 silent slots — flushing mid-decode (%d symbols)", dataCount);
-                                processPayload();
-                                state            = STATE_IDLE;
-                                consecutiveF0    = 0;
-                                postCount        = 0;
-                                dataCount        = 0;
-                                silenceCount     = 0;
-                                skipGuardSamples = 0;
-                            }
-                        }
                     }
-                    // tone == 0 (F0 sync) seen during data: unexpected; ignore this slot
                     break;
 
                 // ────────────────── POSTAMBLE ──────────────────────────
@@ -390,16 +446,12 @@ static void demodTask(void *arg) {
                             consecutiveF0    = 0;
                             postCount        = 0;
                             dataCount        = 0;
-                            silenceCount     = 0;
                             skipGuardSamples = 0;
+                            lastF0HitMs      = 0;
                         }
                     } else {
-                        // Non-F0 tone (data band) or silence during postamble window.
-                        // Do NOT re-enter DATA — this path was consuming ambient noise
-                        // as fake late symbols and preventing postamble lock.
-                        // Just log and stay here; idle timeout will flush if F0 never arrives.
                         if (tone != -1) {
-                            ESP_LOGD(TAG, "Postamble: ignoring non-F0 tone %d (SNR=%.1f)", tone, rawSnr);
+                            ESP_LOGD(TAG, "Postamble: ignoring tone %d (SNR=%.1f)", tone, rawSnr);
                         }
                     }
                     break;
@@ -410,9 +462,12 @@ static void demodTask(void *arg) {
 
 // ── Entry point ───────────────────────────────────────────────────
 void app_main(void) {
-    ESP_LOGI(TAG, "=== SonicPay Piece 3: 8-FSK Demodulation (2050–3600 Hz) ===");
-    ESP_LOGI(TAG, "Packet: [amount_paise:2][nonce:2][sig:64][crc:2] = 70 bytes");
-    ESP_LOGI(TAG, "188 data symbols × 50ms + 10ms guard = ~11.3s TX");
+    ESP_LOGI(TAG, "=== SonicPay Full Terminal (8-FSK + Crypto + SPIFFS + OLED/LED/Buzzer) ===");
+    
+    // Init hardware peripherals & SPIFFS ledger
+    peripherals_init();
+    ledger_init();
     initHardware();
+
     xTaskCreate(demodTask, "demod", 16384, NULL, 1, NULL);
 }
