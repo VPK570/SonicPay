@@ -22,7 +22,7 @@ const { width } = Dimensions.get('window');
 // ---------------------------------------------------------------------------
 
 const KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', '⌫'];
-const MAX_AMOUNT_RUPEES = 655.35;
+const MAX_AMOUNT_RUPEES = 10000;
 
 type ScreenState = 'splash' | 'keypad' | 'processing' | 'success' | 'error';
 
@@ -38,10 +38,10 @@ interface TransactionRecord {
 // Helper: 70-byte packet builder
 // ---------------------------------------------------------------------------
 
-function buildPacket(amountPaise: number, nonce: number, signature: Uint8Array): Uint8Array {
+function buildPacket(amountRupees: number, nonce: number, signature: Uint8Array): Uint8Array {
   const packet = new Uint8Array(70);
-  packet[0] = (amountPaise >> 8) & 0xff;
-  packet[1] =  amountPaise       & 0xff;
+  packet[0] = (amountRupees >> 8) & 0xff;
+  packet[1] =  amountRupees       & 0xff;
   packet[2] = (nonce >> 8) & 0xff;
   packet[3] =  nonce       & 0xff;
   packet.set(signature, 4);
@@ -185,7 +185,7 @@ export default function HomeScreen() {
       return;
     }
     if (floatVal > MAX_AMOUNT_RUPEES) {
-      console.warn('[SonicPay System Log] Amount exceeds max limit ₹655.35:', floatVal);
+      console.warn('[SonicPay System Log] Amount exceeds max limit ₹10,000:', floatVal);
       return;
     }
     if (!isReady) {
@@ -206,22 +206,23 @@ export default function HomeScreen() {
     setScreenState('processing');
 
     try {
-      const amountPaise = Math.round(floatVal * 100);
-      console.log(`[SonicPay System Log] Initiating transaction: ₹${floatVal.toFixed(2)} (${amountPaise} paise)`);
+      const amountRupees = Math.round(floatVal);
+      const amountPaise  = Math.round(floatVal * 100);
+      console.log(`[SonicPay System Log] Initiating transaction: ₹${floatVal.toFixed(2)} (${amountRupees} rupees)`);
 
       const newNonce = await incrementNonce();
       console.log(`[SonicPay System Log] Monotonic nonce assigned: #${newNonce}`);
 
       const message = new Uint8Array(4);
-      message[0] = (amountPaise >> 8) & 0xff;
-      message[1] =  amountPaise       & 0xff;
+      message[0] = (amountRupees >> 8) & 0xff;
+      message[1] =  amountRupees       & 0xff;
       message[2] = (newNonce >> 8)    & 0xff;
       message[3] =  newNonce          & 0xff;
 
       const signature = signRaw(message);
       console.log(`[SonicPay System Log] Ed25519 signature generated: 64 bytes`);
 
-      const packet = buildPacket(amountPaise, newNonce, signature);
+      const packet = buildPacket(amountRupees, newNonce, signature);
       console.log(`[SonicPay System Log] 70-byte packet ready. Transmitting 187 symbols over 8-FSK…`);
 
       const generatedTxId = `45${Math.floor(100000000 + Math.random() * 900000000)}`;
