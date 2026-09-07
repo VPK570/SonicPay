@@ -1,6 +1,6 @@
 # SonicPay — Build Roadmap
 
-Customer-side React Native (Expo) app that generates encrypted audio chirps for offline payments.
+Customer-side React Native (Expo) app that generates encrypted audio chirps for offline payments, paired with an ESP32 hardware payment terminal.
 
 ---
 
@@ -8,19 +8,19 @@ Customer-side React Native (Expo) app that generates encrypted audio chirps for 
 
 - [x] Expo managed workflow initialized
 - [x] HomeScreen with amount entry keypad
-- [x] Send Payment button (placeholder)
+- [x] Send Payment button & teal sleek UI design
 
 **Deps:** expo, react-native
-**Gotcha:** None yet — pure UI.
+**Gotcha:** Clean responsive layout with modern UPI-style UX.
 
 ---
 
 ## Piece 2 — Nonce Management (AsyncStorage)
 
-- [ ] Install `@react-native-async-storage/async-storage`
-- [ ] Nonce store: load, increment, persist
-- [ ] Reset nonce on corruption (try/catch fallback)
-- [ ] Nonce displayed on screen for debug
+- [x] Install `@react-native-async-storage/async-storage`
+- [x] Nonce store: load, increment, persist
+- [x] Reset nonce on corruption (try/catch fallback)
+- [x] Nonce displayed on screen for debug / transaction tracking
 
 **Deps:** `@react-native-async-storage/async-storage`
 **Gotcha:** AsyncStorage is async — wrap in try/catch. Handle corruption gracefully (reset to 0 on error).
@@ -29,51 +29,50 @@ Customer-side React Native (Expo) app that generates encrypted audio chirps for 
 
 ## Piece 3 — Ed25519 Key Generation + Transaction Signing
 
-- [ ] Install `tweetnacl`
-- [ ] Generate keypair on first launch, persist pubkey to AsyncStorage
-- [ ] Sign transaction payload: `merchantId + amount + timestamp + nonce`
-- [ ] Verify detached signature is 64 bytes (ESP32 firmware expects this)
-- [ ] Display pubkey (truncated) on screen for debug
+- [x] Install `tweetnacl`
+- [x] Generate keypair on launch, persist pubkey to AsyncStorage
+- [x] Sign transaction payload: `amount_paise + nonce` with 64-byte Ed25519 signature
+- [x] Verify detached signature (64 bytes) matches ESP32 Monocypher cryptographic verification
+- [x] Display pubkey (truncated) on screen for debug
 
 **Deps:** `tweetnacl`
-**Gotcha:** `sign.detached()` returns 64-byte signature — must match ESP32 expectations exactly.
+**Gotcha:** `sign.detached()` returns 64-byte signature — matches ESP32 Monocypher expectations.
 
 ---
 
 ## Piece 4 — M-FSK Chirp Generation
 
-- [ ] Install `expo-audio` (hooks-based API: `useAudioPlayer`)
-- [ ] Implement M-FSK encoder: map bits to frequency tones
-- [ ] Frequency range: 12–15 kHz (audible but masked in noisy envs)
-- [ ] Generate audio buffer with tone sequence
-- [ ] Set audio mode: speaker output (not earpiece) via `setAudioModeAsync()`
-- [ ] Play chirp, verify audible output
+- [x] Install `expo-audio` / PCM WAV audio generation
+- [x] Implement 8-FSK encoder: map 3 bits per symbol to frequency tones
+- [x] Frequency range: Audio Frequencies (2050–3600 Hz) / 12–15 kHz configurable
+- [x] Generate audio WAV buffer with tone sequence & preamble/postamble sync
+- [x] Set audio mode: speaker output via `setAudioModeAsync()`
+- [x] Play chirp, verify audible output
 
 **Deps:** `expo-audio`
-**Gotcha:** `setAudioModeAsync()` must be called before playback. 12-15 kHz rolls off on cheap phone speakers — test with real hardware.
+**Gotcha:** `setAudioModeAsync()` must be called before playback.
 
 ---
 
-## Piece 5 — Full Transaction Flow
+## Piece 5 — Full Transaction Flow & Hardware Terminal Integration
 
-- [ ] Wire keypad → nonce → sign → encode → chirp
-- [ ] Status feedback: signing... → encoding... → playing... → done
-- [ ] Error handling: failed sign, audio init failure, etc.
-- [ ] Transaction summary display (amount, pubkey, nonce)
+- [x] Wire keypad → nonce → sign → encode → chirp
+- [x] Status feedback: signing... → encoding... → playing... → done
+- [x] Error handling: failed sign, audio init failure, etc.
+- [x] Transaction summary display (amount, pubkey, nonce, timestamp)
+- [x] Hardware ESP32 terminal firmware with Goertzel DSP, Monocypher crypto, SPIFFS ledger persistence, and SSD1306 OLED UI
 
-**Deps:** Pieces 2, 3, 4
-**Gotcha:** No internet — don't import anything that phones home. Expo dev tools will want connectivity.
+**Deps:** Pieces 2, 3, 4 + ESP32 C firmware
+**Gotcha:** No internet — all verification and transaction processing happens 100% on-device.
 
 ---
 
-## Piece 6 — Polish
+## Piece 6 — Polish & Terminal Integration
 
-- [ ] Animations (button press, status transitions)
-- [ ] Error states with recovery
-- [ ] Replay attack demo mode for judges (replay same chirp, show nonce rejection)
-- [ ] Visual feedback during chirp playback (waveform/indicator)
-
-**No new deps.** Pure UI/logic polish.
+- [x] Sleek multi-screen state transitions (Keypad → Transmitting Chirp → Success / Error)
+- [x] Nonce-based replay attack rejection on hardware terminal
+- [x] SSD1306 OLED display status feedback, LED status indicator, piezoceramic audio feedback on terminal
+- [x] SPIFFS ledger storage for flash-persistent transaction logs on hardware terminal
 
 ---
 
@@ -81,17 +80,23 @@ Customer-side React Native (Expo) app that generates encrypted audio chirps for 
 
 | Component | Choice | Why |
 |-----------|--------|-----|
-| Framework | React Native + Expo (managed) | Hackathon speed |
-| Audio | expo-audio | Hooks-based, replaces deprecated expo-av |
-| Crypto | tweetnacl | Ed25519, lighter than noble-ed25519 |
-| Storage | AsyncStorage | Simple key-value, no setup |
-| Backend | None | All logic on-device |
+| Mobile Framework | React Native + Expo (managed) | Cross-platform rapid UI & audio playback |
+| Mobile Crypto | tweetnacl | Lightweight Ed25519 signing |
+| Mobile Storage | AsyncStorage | Local nonce persistence |
+| Hardware Terminal | ESP32 (ESP-IDF v5.x) | Low-power microcontroller with hardware ADC & timers |
+| Hardware DSP | Goertzel Algorithm | Fast multi-frequency tone detection without full FFT overhead |
+| Hardware Crypto | Monocypher | C-native Ed25519 signature verification |
+| Hardware Display | SSD1306 OLED (I2C) | Clear real-time status output for payment terminal |
+| Hardware Storage | SPIFFS Flash Ledger | On-device persistent transaction ledger |
+
+---
 
 ## Chirp Format
 
 ```
-Payload = MerchantID + Amount + Timestamp + Nonce + Ed25519 Signature
-Encoding = M-FSK (12–15 kHz)
+Payload = Amount (2 bytes) + Nonce (2 bytes) + Ed25519 Signature (64 bytes) + CRC16 (2 bytes)
+Encoding = 8-FSK (3 bits per symbol, 187 data symbols + preamble/postamble)
 ```
 
-Terminal-side ESP32 demodulates via FFT — chirp format must match firmware expectations.
+Terminal-side ESP32 demodulates via Goertzel DSP and validates cryptographic signatures for offline transactions.
+

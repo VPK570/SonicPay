@@ -1,16 +1,24 @@
-# SonicPay 
+# SonicPay 🔊💳
 
-SonicPay is an offline-first micropayment system that enables secure, contactless transactions without internet, cellular connectivity, or Bluetooth. It uses high-frequency **M-FSK (Multiple Frequency-Shift Keying)** audio chirps (12–15 kHz) to transmit Ed25519-signed transaction payloads from a mobile application to a receiver terminal (ESP32).
+> **Offline Acoustic Payment Verification System for Offline UPI**  
+> *36-Hour Hackathon Project*
+
+SonicPay is an offline payment verification system designed for offline UPI ecosystems. It enables contactless, cryptographic payment proof verification without requiring internet, cellular connectivity, or Bluetooth pairing. 
+
+> [!NOTE]
+> **Scope & Purpose**: SonicPay focuses on **offline payment verification** — generating, transmitting, and cryptographically validating tamper-proof transaction proof payloads on terminal hardware. It does not perform actual interbank fiat money settlement.
+
+It uses **8-FSK (Frequency-Shift Keying)** audio chirps to transmit Ed25519-signed payment verification payloads from a mobile app to an ESP32 hardware terminal.
 
 ---
 
-## Key Features
+## 🌟 Key Features
 
-- **100% Offline**: No cellular data, Wi-Fi, internet connection, or Bluetooth pairing required.
-- **Cryptographically Secure**: Transactions are signed on-device using **Ed25519** asymmetric cryptography (via `tweetnacl`).
-- **Replay Protection**: Monotonic nonce management persisted via `AsyncStorage` prevents transaction replay attacks.
-- **Acoustic Data Transfer**: Data encoded into M-FSK audio tones in the 12 kHz – 15 kHz frequency band, designed to be audible yet masked in ambient room noise.
-- **Real-Time Hardware Demodulation**: Hardware terminal running on ESP32 using the **Goertzel algorithm** for low-latency DSP tone detection and state-machine decoding.
+- **📶 100% Offline Verification**: No cellular data, Wi-Fi, internet connection, or Bluetooth pairing required for proof verification.
+- **🔐 Cryptographically Secure Proofs**: Payment receipts are signed on-device using **Ed25519** asymmetric cryptography (via `tweetnacl`) and verified in C (via `Monocypher`).
+- **🛡️ Replay Protection**: Monotonic nonce management persisted via `AsyncStorage` and verified by the hardware terminal prevents transaction replay attacks.
+- **🎵 Acoustic Data Transfer**: Data encoded into 8-FSK audio chirps (2050–3600 Hz / 12–15 kHz) for robust speaker-to-microphone transmission.
+- **⚡ Real-Time Hardware Demodulation & Display**: ESP32 receiver terminal uses the **Goertzel algorithm** for DSP tone detection, validating signatures and logging verified receipts to an on-device SPIFFS flash ledger while presenting real-time feedback via SSD1306 OLED, LEDs, and buzzer.
 
 ---
 
