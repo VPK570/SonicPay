@@ -2,19 +2,78 @@ import { useCallback, useRef, useEffect } from 'react';
 import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { File, Paths } from 'expo-file-system';
 
-const SAMPLE_RATE = 44100;
-// 8-FSK tones matching ESP32 Piece 3 firmware (12000 - 14800 Hz, 400 Hz step)
-const FREQS = [12000, 12400, 12800, 13200, 13600, 14000, 14400, 14800];
-const PREAMBLE_FREQ = 12000; // F0 tone
-const SYMBOL_DURATION_MS = 80;  // must match firmware SYMBOL_SAMPLES / SAMPLE_RATE
-const SYMBOL_SAMPLES = Math.floor(SAMPLE_RATE * SYMBOL_DURATION_MS / 1000);
-const PREAMBLE_MS = 240; // 3 symbols × 80ms — must match firmware PREAMBLE_SYMS
-const POSTAMBLE_MS = 160; // 2 symbols × 80ms — must match firmware POSTAMBLE_SYMS
+// ---------------------------------------------------------------------------
+// 8-FSK Acoustic Modem — SonicPay v2
+//
+// Frequency plan (9 tones total):
+//   F0 = 2050 Hz  — sync only (preamble + postamble, never data)
+//   F1 = 2200 Hz  — data value 0  (bits 000)
+//   F2 = 2400 Hz  — data value 1  (bits 001)
+//   F3 = 2600 Hz  — data value 2  (bits 010)
+//   F4 = 2800 Hz  — data value 3  (bits 011)
+//   F5 = 3000 Hz  — data value 4  (bits 100)
+//   F6 = 3200 Hz  — data value 5  (bits 101)
+//   F7 = 3400 Hz  — data value 6  (bits 110)
+//   F8 = 3600 Hz  — data value 7  (bits 111)
+//
+// Packet: [amount:2][nonce:2][signature:64][crc:2] = 70 bytes = 560 bits
+// 8-FSK: 3 bits per symbol → ceil(560/3) = 187, rounded up to 188 for clean boundary
+// Symbol duration : 50 ms
+// Guard interval  : 10 ms silent between symbols
+// Preamble        : 3 consecutive F0 hits
+// Postamble       : 2 consecutive F0 hits
+// ---------------------------------------------------------------------------
 
-function textToBits(str: string): number[] {
+const SAMPLE_RATE = 44100; // Phone WAV sample rate (ESP32 ADC is 36096 — separate)
+
+const PREAMBLE_FREQ = 2050; // F0 — sync tone
+const DATA_FREQS = [        // F1–F8 — data tones, index = 3-bit symbol value (0–7)
+  2200, // 000
+  2400, // 001
+  2600, // 010
+  2800, // 011
+  3000, // 100
+  3200, // 101
+  3400, // 110
+  3600, // 111
+];
+
+const SYMBOL_DURATION_MS = 50; // ms per data/sync symbol
+const GUARD_DURATION_MS  = 10; // ms silent guard between symbols
+
+// 70-byte packet → 560 bits → ceil(560/3) = 187, rounded up to 188
+const PACKET_BYTES  = 70;
+const TOTAL_BITS    = PACKET_BYTES * 8; // 560
+const BITS_PER_SYM  = 3;
+const NUM_DATA_SYMS = Math.ceil(TOTAL_BITS / BITS_PER_SYM); // 188
+
+// ---------------------------------------------------------------------------
+// CRC-16/CCITT — exported so HomeScreen can compute packet CRC
+// ---------------------------------------------------------------------------
+export function crc16_ccitt(data: Uint8Array): number {
+  let crc = 0xffff;
+  for (let i = 0; i < data.length; i++) {
+    crc ^= data[i] << 8;
+    for (let j = 0; j < 8; j++) {
+      if ((crc & 0x8000) !== 0) {
+        crc = ((crc << 1) ^ 0x1021) & 0xffff;
+      } else {
+        crc = (crc << 1) & 0xffff;
+      }
+    }
+  }
+  return crc & 0xffff;
+}
+
+// ---------------------------------------------------------------------------
+// Bit helpers
+// ---------------------------------------------------------------------------
+
+/** Convert a Uint8Array to an array of bits (MSB-first per byte). */
+function bytesToBits(bytes: Uint8Array): number[] {
   const bits: number[] = [];
-  for (let i = 0; i < str.length; i++) {
-    const byte = str.charCodeAt(i) & 0xff;
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = bytes[i];
     for (let b = 7; b >= 0; b--) {
       bits.push((byte >> b) & 1);
     }
@@ -22,51 +81,78 @@ function textToBits(str: string): number[] {
   return bits;
 }
 
-function bitsToSymbols(bits: number[]): number[] {
+/**
+ * Pack bits into 8-FSK symbols (3 bits each).
+ * The bit array is padded with trailing zeros to a multiple of 3.
+ * Returns exactly NUM_DATA_SYMS (188) symbols for a 70-byte packet.
+ */
+function bitsToSymbols8(bits: number[]): number[] {
+  // Pad to next multiple of BITS_PER_SYM
+  const padded = [...bits];
+  while (padded.length % BITS_PER_SYM !== 0) padded.push(0);
+
   const symbols: number[] = [];
-  for (let i = 0; i < bits.length; i += 3) {
-    let val = 0;
-    for (let j = 0; j < 3; j++) {
-      val = (val << 1) | (bits[i + j] || 0);
-    }
-    symbols.push(val);
+  for (let i = 0; i < padded.length; i += BITS_PER_SYM) {
+    const val = (padded[i] << 2) | (padded[i + 1] << 1) | padded[i + 2];
+    symbols.push(val); // 0–7
   }
   return symbols;
 }
 
+// ---------------------------------------------------------------------------
+// Audio synthesis
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a single tone with a 5 ms raised-cosine fade in/out to reduce
+ * spectral splatter at symbol boundaries.
+ */
 function generateTone(freq: number, durationMs: number, sampleRate: number): Float32Array {
-  const numSamples = Math.floor(sampleRate * durationMs / 1000);
-  const samples = new Float32Array(numSamples);
+  const numSamples  = Math.floor(sampleRate * durationMs / 1000);
+  const samples     = new Float32Array(numSamples);
+  const rampSamples = Math.floor(sampleRate * 0.005); // 5 ms ramp
+
   for (let i = 0; i < numSamples; i++) {
-    samples[i] = Math.sin(2 * Math.PI * freq * i / sampleRate);
+    let amp = 1.0;
+    if (i < rampSamples) {
+      amp = 0.5 * (1 - Math.cos(Math.PI * i / rampSamples));
+    } else if (i > numSamples - rampSamples) {
+      amp = 0.5 * (1 - Math.cos(Math.PI * (numSamples - i) / rampSamples));
+    }
+    samples[i] = amp * Math.sin(2 * Math.PI * freq * i / sampleRate);
   }
   return samples;
 }
 
+function generateSilence(durationMs: number, sampleRate: number): Float32Array {
+  return new Float32Array(Math.floor(sampleRate * durationMs / 1000));
+}
+
+// ---------------------------------------------------------------------------
+// WAV builder — 16-bit PCM, mono
+// ---------------------------------------------------------------------------
 function buildWAV(samples: Float32Array, sampleRate: number): string {
   const numSamples = samples.length;
-  const dataSize = numSamples * 2;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
+  const dataSize   = numSamples * 2; // 16-bit samples
+  const buffer     = new ArrayBuffer(44 + dataSize);
+  const view       = new DataView(buffer);
 
-  const writeString = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
   };
 
-  writeString(0, 'RIFF');
+  writeStr(0, 'RIFF');
   view.setUint32(4, 36 + dataSize, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);           // PCM chunk size
+  view.setUint16(20, 1, true);            // PCM format
+  view.setUint16(22, 1, true);            // mono
   view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeString(36, 'data');
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true);            // block align
+  view.setUint16(34, 16, true);           // bits per sample
+  writeStr(36, 'data');
   view.setUint32(40, dataSize, true);
 
   for (let i = 0; i < numSamples; i++) {
@@ -74,6 +160,7 @@ function buildWAV(samples: Float32Array, sampleRate: number): string {
     view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
   }
 
+  // Encode to base64 in 8 kB chunks to avoid stack overflow on large payloads
   const bytes = new Uint8Array(buffer);
   let binary = '';
   for (let i = 0; i < bytes.length; i += 8192) {
@@ -82,9 +169,12 @@ function buildWAV(samples: Float32Array, sampleRate: number): string {
   return btoa(binary);
 }
 
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
 export function useChirp() {
-  const playingRef = useRef(false);
-  const playerRef = useRef<any>(null);
+  const playingRef  = useRef(false);
+  const playerRef   = useRef<any>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -97,40 +187,66 @@ export function useChirp() {
     };
   }, []);
 
-  const playChirp = useCallback(async (base64Payload: string) => {
+  /**
+   * Encode and play a 70-byte SonicPay packet as an 8-FSK chirp.
+   *
+   * Packet layout (caller's responsibility):
+   *   [amount:2][nonce:2][signature:64][crc:2] = 70 bytes
+   *
+   * Acoustic structure:
+   *   3 × F0 sync  →  188 × data symbols  →  2 × F0 sync
+   *   Each slot = 50 ms tone + 10 ms silence
+   *
+   * Total transmission time:
+   *   193 slots × 60 ms = 11.58 s
+   */
+  const playChirp = useCallback(async (payload: Uint8Array) => {
+    if (payload.length !== PACKET_BYTES) {
+      throw new Error(`[useChirp] Expected ${PACKET_BYTES}-byte packet, got ${payload.length}`);
+    }
     if (playingRef.current) return;
     playingRef.current = true;
 
     try {
-      const bits = textToBits(base64Payload);
-      const symbols = bitsToSymbols(bits);
+      const bits    = bytesToBits(payload);
+      const symbols = bitsToSymbols8(bits); // → 188 symbols
 
-      const preamble = generateTone(PREAMBLE_FREQ, PREAMBLE_MS, SAMPLE_RATE);
-      const postamble = generateTone(PREAMBLE_FREQ, POSTAMBLE_MS, SAMPLE_RATE);
+      // Pre-compute slot sizes
+      const toneSamples  = Math.floor(SAMPLE_RATE * SYMBOL_DURATION_MS / 1000); // 2205
+      const guardSamples = Math.floor(SAMPLE_RATE * GUARD_DURATION_MS  / 1000); // 441
+      const slotSamples  = toneSamples + guardSamples;                           // 2646
 
-      const totalSamples = preamble.length + symbols.length * SYMBOL_SAMPLES + postamble.length;
-      const allSamples = new Float32Array(totalSamples);
+      const numSlots     = 3 + NUM_DATA_SYMS + 2; // 3 pre + 188 data + 2 post = 193
+      const totalSamples = numSlots * slotSamples;
+      const allSamples   = new Float32Array(totalSamples);
 
       let offset = 0;
-      allSamples.set(preamble, offset);
-      offset += preamble.length;
 
-      for (const sym of symbols) {
-        const tone = generateTone(FREQS[sym], SYMBOL_DURATION_MS, SAMPLE_RATE);
-        allSamples.set(tone, offset);
-        offset += tone.length;
-      }
+      const writeSlot = (freq: number) => {
+        const tone  = generateTone(freq, SYMBOL_DURATION_MS, SAMPLE_RATE);
+        const guard = generateSilence(GUARD_DURATION_MS, SAMPLE_RATE);
+        allSamples.set(tone, offset);  offset += tone.length;
+        allSamples.set(guard, offset); offset += guard.length;
+      };
 
-      allSamples.set(postamble, offset);
+      // Preamble: 3 × F0 (2050 Hz)
+      for (let p = 0; p < 3; p++) writeSlot(PREAMBLE_FREQ);
+
+      // Data: 188 × 8-FSK symbols mapped to F1–F8 (2200–3600 Hz)
+      for (const sym of symbols) writeSlot(DATA_FREQS[sym]);
+
+      // Postamble: 2 × F0 (2050 Hz)
+      for (let p = 0; p < 2; p++) writeSlot(PREAMBLE_FREQ);
 
       const wavBase64 = buildWAV(allSamples, SAMPLE_RATE);
 
+      // Write WAV to cache and play via expo-audio
       const file = new File(Paths.cache, 'chirp.wav');
       await file.write(wavBase64, { encoding: 'base64' });
 
       await setAudioModeAsync({
         playsInSilentMode: true,
-        allowsRecording: false,
+        allowsRecording:   false,
       });
 
       const player = createAudioPlayer({ uri: file.uri });
@@ -138,6 +254,7 @@ export function useChirp() {
       player.volume = 1.0;
       player.play();
 
+      // Poll until playback ends (expo-audio doesn't expose an onFinish promise)
       await new Promise<void>((resolve) => {
         intervalRef.current = setInterval(() => {
           if (!player.playing) {
@@ -150,15 +267,10 @@ export function useChirp() {
         }, 50);
       });
     } catch (err) {
-      console.error('Chirp playback failed:', err);
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
-      if (playerRef.current) {
-        playerRef.current.remove();
-        playerRef.current = null;
-      }
+      console.error('[useChirp] Playback failed:', err);
+      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+      if (playerRef.current)   { playerRef.current.remove(); playerRef.current = null; }
+      throw err; // re-throw so HomeScreen can set error state
     } finally {
       playingRef.current = false;
     }

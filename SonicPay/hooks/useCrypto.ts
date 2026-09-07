@@ -11,7 +11,7 @@ nacl.setPRNG((x, n) => {
   for (let i = 0; i < n; i++) x[i] = v[i];
 });
 
-const PUBKEY_KEY = 'sonicpay_pubkey';
+const PUBKEY_KEY    = 'sonicpay_pubkey';
 const SECRETKEY_KEY = 'sonicpay_secretkey';
 
 export function useCrypto() {
@@ -29,33 +29,53 @@ export function useCrypto() {
           return;
         }
       } catch {
-        // corrupted storage, generate fresh
+        // Corrupted storage — generate fresh keypair
+        console.warn('[useCrypto] Corrupted keypair in storage, generating new one');
       }
       const kp = nacl.sign.keyPair();
       setKeypair(kp);
       try {
         await AsyncStorage.multiSet([
-          [PUBKEY_KEY, util.encodeBase64(kp.publicKey)],
+          [PUBKEY_KEY,    util.encodeBase64(kp.publicKey)],
           [SECRETKEY_KEY, util.encodeBase64(kp.secretKey)],
         ]);
       } catch (e) {
-        console.warn('Failed to persist keypair:', e);
+        console.warn('[useCrypto] Failed to persist keypair:', e);
       }
     })();
   }, []);
 
-  const signTransaction = useCallback((payload: Record<string, unknown>): { payload: string; signature: string } => {
-    if (!keypair) throw new Error('Keypair not loaded');
-    const payloadStr = JSON.stringify(payload);
-    const payloadBytes = util.decodeUTF8(payloadStr);
-    const sig = nacl.sign.detached(payloadBytes, keypair.secretKey);
-    return {
-      payload: util.encodeBase64(payloadBytes),
-      signature: util.encodeBase64(sig),
-    };
+  /**
+   * Sign raw bytes with the Ed25519 private key.
+   * Returns a 64-byte detached signature (Uint8Array).
+   *
+   * Used by HomeScreen to sign [amount_paise:2][nonce:2] before acoustic TX.
+   * The ESP32 firmware verifies this signature using the hardcoded public key.
+   */
+  const signRaw = useCallback((message: Uint8Array): Uint8Array => {
+    if (!keypair) throw new Error('[useCrypto] Keypair not loaded');
+    return nacl.sign.detached(message, keypair.secretKey); // always 64 bytes
   }, [keypair]);
+
+  /**
+   * Sign a JSON-serialisable payload (kept for diagnostic / demo use).
+   * @deprecated — acoustic TX uses signRaw() instead.
+   */
+  const signTransaction = useCallback(
+    (payload: Record<string, unknown>): { payload: string; signature: string } => {
+      if (!keypair) throw new Error('[useCrypto] Keypair not loaded');
+      const payloadStr  = JSON.stringify(payload);
+      const payloadBytes = util.decodeUTF8(payloadStr);
+      const sig = nacl.sign.detached(payloadBytes, keypair.secretKey);
+      return {
+        payload:   util.encodeBase64(payloadBytes),
+        signature: util.encodeBase64(sig),
+      };
+    },
+    [keypair],
+  );
 
   const publicKey = keypair ? util.encodeBase64(keypair.publicKey) : null;
 
-  return { publicKey, signTransaction, isReady: keypair !== null };
+  return { publicKey, signRaw, signTransaction, isReady: keypair !== null };
 }
