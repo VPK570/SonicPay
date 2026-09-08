@@ -17,7 +17,13 @@
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundColor": "#0D9488"
       },
-      "package": "com.sonicpay.app"
+      "package": "com.sonicpay.app",
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png",
@@ -26,6 +32,11 @@
     "plugins": [
       "expo-status-bar",
       "expo-audio"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "68b18a73-d409-47ee-ab81-e0329d06081d"
+      }
+    }
   }
 }
